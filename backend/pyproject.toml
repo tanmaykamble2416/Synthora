@@ -1,11 +1,17 @@
 [project]
-name = "researchmind-backend"
-version = "0.1.0"
+name = "synthora-backend"
+version = "0.2.0"
 requires-python = ">=3.12,<3.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
-    "integration: tests that need a running PostgreSQL (enable with RUN_DB_TESTS=1)",
+    "integration: tests that need PostgreSQL (enable with RUN_DB_TESTS=1; uses TEST_POSTGRES_DB only)",
+]
+filterwarnings = [
+    # Any SQLAlchemy mapper/relationship warning is a real bug -> fail the test.
+    "error::sqlalchemy.exc.SAWarning",
 ]

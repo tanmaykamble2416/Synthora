@@ -22,6 +22,7 @@ class AppError(Exception):
 
     status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR
     code: str = "INTERNAL_ERROR"
+    headers: dict[str, str] | None = None
 
     def __init__(self, message: str, details: list[dict[str, Any]] | None = None) -> None:
         super().__init__(message)
@@ -39,19 +40,50 @@ class ExtensionMissingError(AppError):
     code = "DATABASE_EXTENSION_MISSING"
 
 
+class AuthenticationError(AppError):
+    """Missing/invalid/expired token or bad login. Message is intentionally generic."""
+
+    status_code = status.HTTP_401_UNAUTHORIZED
+    code = "AUTHENTICATION_FAILED"
+    headers = {"WWW-Authenticate": "Bearer"}
+
+
+class BadRequestError(AppError):
+    status_code = status.HTTP_400_BAD_REQUEST
+    code = "BAD_REQUEST"
+
+
+class NotFoundError(AppError):
+    """Also used for resources owned by someone else, so their existence is not revealed."""
+
+    status_code = status.HTTP_404_NOT_FOUND
+    code = "NOT_FOUND"
+
+
+class ConflictError(AppError):
+    status_code = status.HTTP_409_CONFLICT
+    code = "CONFLICT"
+
+
 def _error_response(
-    status_code: int, code: str, message: str, details: list[dict[str, Any]] | None = None
+    status_code: int,
+    code: str,
+    message: str,
+    details: list[dict[str, Any]] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     body = ErrorResponse(error=ErrorBody(code=code, message=message, details=details))
-    return JSONResponse(status_code=status_code, content=jsonable_encoder(body))
+    return JSONResponse(status_code=status_code, content=jsonable_encoder(body), headers=headers)
 
 
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
     logger.warning("%s on %s %s: %s", exc.code, request.method, request.url.path, exc.message)
-    return _error_response(exc.status_code, exc.code, exc.message, exc.details)
+    return _error_response(exc.status_code, exc.code, exc.message, exc.details, exc.headers)
 
 
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Only loc/msg/type are returned: the rejected *input* is never echoed back,
+    # so a password that fails validation does not appear in the response.
     details = [
         {"loc": list(err.get("loc", ())), "msg": err.get("msg", ""), "type": err.get("type", "")}
         for err in exc.errors()
@@ -63,7 +95,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     message = exc.detail if isinstance(exc.detail, str) else "HTTP error."
-    return _error_response(exc.status_code, f"HTTP_{exc.status_code}", message)
+    headers = getattr(exc, "headers", None)
+    return _error_response(exc.status_code, f"HTTP_{exc.status_code}", message, headers=headers)
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
