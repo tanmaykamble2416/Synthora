@@ -6,10 +6,13 @@ Safety layers:
   2. Every engine/URL used here is built with database_url_for(test_db).
   3. The test DB is created if missing; no database is ever dropped. Data is reset
      with TRUNCATE on the test DB only.
+  4. Uploaded files go to a per-test tmp_path storage root (outside the project),
+     never to the real PAPER_STORAGE_DIR.
 """
 
 import asyncio
 from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -22,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from alembic import command
-from app.core.config import ENV_FILE, Settings, get_settings
+from app.core.config import ENV_FILE, PROJECT_ROOT, Settings, get_settings
 from tests.conftest import TEST_JWT_SECRET
 from tests.db_safety import assert_safe_test_database
 
@@ -116,19 +119,47 @@ async def db_session(test_db_url: URL) -> AsyncIterator[AsyncSession]:
 
 
 @pytest.fixture
-def api_client(monkeypatch: pytest.MonkeyPatch, test_db_name: str) -> Iterator[TestClient]:
-    """The real app, pointed at the test DB via environment overrides."""
+def storage_root(tmp_path: Path) -> Path:
+    """Isolated per-test paper storage. Tests never write to the real storage directory."""
+    root = (tmp_path / "paper-storage").resolve()
+    assert not root.is_relative_to(PROJECT_ROOT), "test storage must live outside the project"
+    return root
+
+
+@contextmanager
+def build_api_client(
+    monkeypatch: pytest.MonkeyPatch,
+    test_db_name: str,
+    storage_root: Path,
+    *,
+    raise_server_exceptions: bool = True,
+    **extra_env: str,
+) -> Iterator[TestClient]:
+    """The real app, pointed at the test DB and an isolated storage root via env overrides."""
     monkeypatch.setenv("POSTGRES_DB", test_db_name)
     monkeypatch.setenv("JWT_SECRET_KEY", TEST_JWT_SECRET)
     monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("PAPER_STORAGE_DIR", str(storage_root))
+    for key, value in extra_env.items():
+        monkeypatch.setenv(key, value)
     get_settings.cache_clear()
-    assert get_settings().postgres_db == test_db_name
+    settings = get_settings()
+    assert settings.postgres_db == test_db_name
+    assert settings.paper_storage_root == storage_root
 
     from app.main import create_app
 
-    with TestClient(create_app()) as client:
+    try:
+        with TestClient(create_app(), raise_server_exceptions=raise_server_exceptions) as client:
+            yield client
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.fixture
+def api_client(monkeypatch: pytest.MonkeyPatch, test_db_name: str, storage_root: Path) -> Iterator[TestClient]:
+    with build_api_client(monkeypatch, test_db_name, storage_root) as client:
         yield client
-    get_settings.cache_clear()
 
 
 DEFAULT_PASSWORD = "correct horse battery staple"

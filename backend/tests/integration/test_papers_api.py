@@ -622,7 +622,7 @@ async def test_repository_never_touches_papers_of_another_owner(db_session: Asyn
     assert await repo.get_owned(paper_id, intruder_id) is None
     assert await repo.list_in_workspace(workspace_id, intruder_id, limit=10, offset=0) == ([], 0)
     assert await repo.update_owned(paper_id, intruder_id, {"title": "Hijacked"}) is None
-    assert await repo.delete_owned(paper_id, intruder_id) is False
+    assert await repo.delete_owned(paper_id, intruder_id) is None  # Day 4: returns storage_key or None
     await db_session.commit()
 
     # Owner still sees the untouched paper (re-read from the database).

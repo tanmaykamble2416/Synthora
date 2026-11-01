@@ -4,10 +4,132 @@ Tagline: Intelligence Beyond Papers.
 
 ---
 
-## Session: Day 3: Paper management API (2026-11-01)
+## Session: Day 4: Secure PDF upload and file storage (2026-11-01)
 
 **Status: implemented and verified in Claude's Linux sandbox (PostgreSQL 16.15).
-PENDING: local verification on Windows + Docker Compose. Day 3 is not complete until that passes.**
+PENDING: local verification on Windows + Docker Compose. Day 4 is not complete until that passes. Not committed.**
+
+### 1. Completed tasks
+- `POST /api/v1/workspaces/{workspace_id}/papers` (multipart field `file`): returns 201 `PaperRead` and a `Location` header.
+- **Auth and ownership before the body is read.** There's no FastAPI `File()` parameter (that would read the whole body before the dependencies run). The endpoint checks the token, then workspace ownership (SQL, 404), and only then parses the multipart body.
+- **Two-layer size limit**, `MAX_UPLOAD_SIZE_MB` (default 25, MiB):
+  - the request layer rejects a declared `Content-Length` above the limit + 64 KiB, and also counts the bytes actually received through a wrapped ASGI `receive`, so a missing or false `Content-Length` can't bypass it;
+  - the file layer enforces the exact limit chunk by chunk (1 MiB) while copying into storage.
+- **Validation:**
+  - filename sanitised (basename, NFC, control/bidi characters stripped, ≤ 255) and must end in `.pdf`, otherwise 415;
+  - declared MIME must be `application/pdf`, `application/octet-stream` or absent, otherwise 415;
+  - the content must start with `%PDF-d.d` **at byte 0** (strict, intentional: anti-polyglot), otherwise 400, checked before the first byte is written;
+  - empty file → 400;
+  - malformed multipart, a wrong field, two files or extra fields → 400. Starlette's parser messages are not echoed.
+- **SHA-256** computed incrementally by the server.
+- **Duplicates:** a pre-check gives 409, and the `UNIQUE (workspace_id, sha256)` violation from a concurrent race is also 409 (no DB details exposed). The same PDF in another workspace is allowed.
+- **Storage service** (`StorageService`):
+  - server-generated keys `papers/YYYY/MM/<uuid4>.pdf`, checked against a strict allow-list pattern, then `resolve()` + `is_relative_to(root)` (blocks `..`, absolute paths, drive letters, UNC paths, backslashes and symlink escapes);
+  - staging in `<root>/.tmp/`, then an atomic `os.replace` into place (same volume).
+- **Cleanup guarantees:**
+  - temp file removed on any failure, including cancellation;
+  - permanent file removed if INSERT/COMMIT fails (duplicate race, FK violation when the workspace vanishes mid-upload → 404, any other error → generic 500).
+- **Delete integration:**
+  - `DELETE … RETURNING storage_key` (owner-scoped), then COMMIT, then delete the file;
+  - if the file deletion fails: 204 anyway, the failure is logged, the key is appended to `<root>/.cleanup/pending-deletions.jsonl`, and the row is never recreated;
+  - `StorageService.retry_pending_deletions()` replays the ledger.
+- Errors: `PayloadTooLargeError` (413) and `UnsupportedMediaTypeError` (415) added; existing envelope reused.
+- `.gitignore`: `*.pdf` and `*.part` added (`storage/` was already ignored).
+
+### 2. Files
+**New:**
+- backend/app/services/storage_service.py
+- backend/app/services/pdf_validation.py
+- backend/app/api/uploads.py (size-limited single-file multipart parsing + OpenAPI request body)
+- backend/tests/unit/__init__.py
+- backend/tests/unit/test_storage_service.py
+- backend/tests/unit/test_pdf_validation.py
+- backend/tests/integration/test_paper_upload_api.py
+
+**Modified:**
+- backend/app/core/config.py (`paper_storage_dir`, `max_upload_size_mb`, `paper_storage_root`, `max_upload_bytes`)
+- backend/app/core/exceptions.py (413, 415)
+- backend/app/db/errors.py (`is_foreign_key_violation`)
+- backend/app/api/deps.py (`get_storage`, `StorageDep`)
+- backend/app/api/v1/endpoints/papers.py (upload endpoint; `StorageDep` passed to the service)
+- backend/app/repositories/paper_repository.py (`create`, `sha256_exists_in_owned_workspace`; `delete_owned` now returns `storage_key | None` instead of `bool`)
+- backend/app/services/paper_service.py (`upload_pdf`, `require_owned_workspace`, delete removes the file)
+- backend/tests/conftest.py (`unit_env` sets a tmp `PAPER_STORAGE_DIR`)
+- backend/tests/integration/conftest.py (`storage_root` fixture, `build_api_client` with `raise_server_exceptions` and extra env)
+- backend/tests/integration/test_papers_api.py (one assertion: `delete_owned(...) is None`, following the return-type change)
+- .env.example, .gitignore, README.md, PROGRESS.md
+
+### 3. Architecture
+```
+endpoint (auth → ownership → size-limited multipart parse)
+  → PaperService.upload_pdf (validate name/MIME → stage → pre-check → commit file → INSERT/COMMIT, cleanup on failure)
+      → pdf_validation (pure functions)   → StorageService (keys, paths, temp, atomic move, delete, ledger)
+      → PaperRepository (SQL, owner filter)
+```
+Blocking file writes run in the thread pool (`run_in_threadpool`). Cleanup paths are synchronous so they also run while a request is being cancelled.
+
+### 4. Database schema changes
+**None. No migration.** Every column and constraint used (`storage_key UNIQUE`, `UNIQUE (workspace_id, sha256)`, FK to workspaces, CHECKs) already existed in `0001`. `alembic check` reports "No new upgrade operations detected."
+
+### 5. Dependencies introduced
+None. Uses only the standard library, FastAPI/Starlette and python-multipart (already installed since Day 2).
+
+### 6. Known limitations
+- **Two copies on disk while uploading:** Starlette spools the uploaded part to an OS temp file (in memory up to 1 MiB) while parsing, and SYNTHORA then copies it into `<root>/.tmp/`. Disk use per upload is bounded by the limit + 64 KiB at each step. A fully streaming parser would remove one copy; deferred.
+- **Filename/MIME are checked after the body is received:** the part headers are only available once Starlette has parsed the body. The body itself is capped, and auth/ownership already run before any of it is read.
+- **Filesystem and DB are not one transaction.**
+  - On upload, the file is committed before the row; a process crash between the two leaves an orphan file with no row.
+  - On delete, the row is committed before the file; a crash after the commit leaves an orphan file that isn't in the ledger.
+  - Both are detectable by a future reconciliation job (files under `papers/` with no matching `storage_key`). That job isn't built yet.
+- **Ledger retry is manual:** the README one-liner. There's no scheduler until Celery (Day 10).
+- **Rows created before Day 4** (Day 3 manual `manual/…` keys) have no file. Deleting them works and logs "invalid storage key".
+- Only a header check: structurally broken PDFs, encrypted PDFs and PDFs with active content are accepted. Day 5 extraction must handle them and set `status = failed` with a safe message.
+- No per-user upload quota or rate limiting.
+- Carried over: no token revocation or login rate limiting.
+
+### 6a. Requirements carried forward
+- **Day 5 processing errors** (unchanged from Day 3): log the full exception server-side, store only a short internal summary in `error_message`, never add it back to `PaperRead`, and use a separate fixed-code field if users need a reason.
+- **Day 5 extraction** reads the file via `StorageService.resolve(storage_key)` only, never via a client-supplied path.
+- **Day 10:** schedule `retry_pending_deletions()` and an orphan-file reconciliation task.
+
+### 7. Test results (Claude's sandbox, PostgreSQL 16.15; NOT yet your machine)
+- `python -m compileall app`: OK.
+- `python -m pytest` (no DB): **161 passed, 208 skipped**.
+- `RUN_DB_TESTS=1 python -m pytest`: **369 passed, 0 failed**. That's the Day 3 baseline of 218, plus 95 new unit tests and 56 new upload integration tests.
+- `alembic check`: "No new upgrade operations detected." `alembic/versions/` still contains only `0001_initial_schema.py`.
+- The real `storage/` directory didn't exist before or after the full run (tests use tmp storage only). The stand-in dev DB sentinel was unchanged.
+- **Concurrency is genuinely exercised:** a temporary probe (deleted afterwards) ran 10 rounds of 6 parallel identical uploads. Every round gave exactly 1×201 + 5×409, one row and one file. **19 of the 50 losers passed the application pre-check and were stopped by the PostgreSQL unique constraint.**
+- **Mutation checks** (each change was reverted afterwards):
+
+  | Safety mechanism removed | Tests that failed |
+  |---|---|
+  | Receive-level byte counter | the two "small file, huge body" tests |
+  | Cleanup after a failed INSERT | 5 tests (insert failure, FK race, unique race, concurrency) |
+  | File removal on delete | 2 delete tests |
+- **Bugs found and fixed during testing:** Starlette converts `MultiPartException` into `HTTPException(400)` carrying parser details (e.g. "Maximum number of fields is 0"). That is now translated into our own `BAD_REQUEST` message.
+
+### 8. Remaining tasks
+- Local verification of Day 4 (blocks completion), then commit after review.
+- Day 5: PyMuPDF text and page extraction + GROBID header/section extraction into `paper_sections`; `status` transitions `uploaded → processing → processed | failed`; `page_count`; safe failure codes.
+- Day 6: chunking into `paper_chunks` (page-anchored).
+- Day 7: migration 0002 (embeddings) + hybrid retrieval (pgvector + `rank_bm25`).
+
+### 9. Exact next development milestone
+On Windows:
+- `python -m compileall app`;
+- `python -m pytest` (expect 161 passed, 208 skipped);
+- `$env:RUN_DB_TESTS="1"; python -m pytest` (expect 369 passed);
+- `alembic check`;
+- the README "Manual testing" walkthrough with a real PDF;
+- confirm `git status` shows no `.env`, PDFs or `storage/`.
+
+Then review and commit. Then Day 5: extraction.
+
+---
+
+## Session: Day 3: Paper management API (2026-11-01)
+
+**Status: verified locally by the user (218 tests passed) and committed (`c38cd01`).**
 
 ### 1. Completed tasks
 - `GET /api/v1/workspaces/{workspace_id}/papers`:

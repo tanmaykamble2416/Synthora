@@ -1,4 +1,4 @@
-"""Shared FastAPI dependencies: DB session, settings and the authenticated user."""
+"""Shared FastAPI dependencies: DB session, settings, paper storage and the authenticated user."""
 
 from typing import Annotated
 
@@ -12,6 +12,7 @@ from app.core.security import INVALID_TOKEN_MESSAGE, decode_access_token
 from app.db.session import get_db_session
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
+from app.services.storage_service import StorageService
 
 # auto_error=False: we raise our own AuthenticationError so the error shape is consistent.
 # tokenUrl is a literal (not read from settings) so importing this module never reads .env.
@@ -37,3 +38,10 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def get_storage(settings: SettingsDep) -> StorageService:
+    return StorageService(settings.paper_storage_root)
+
+
+StorageDep = Annotated[StorageService, Depends(get_storage)]

@@ -65,6 +65,16 @@ class ConflictError(AppError):
     code = "CONFLICT"
 
 
+class PayloadTooLargeError(AppError):
+    status_code = status.HTTP_413_CONTENT_TOO_LARGE
+    code = "PAYLOAD_TOO_LARGE"
+
+
+class UnsupportedMediaTypeError(AppError):
+    status_code = status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
+    code = "UNSUPPORTED_MEDIA_TYPE"
+
+
 def _error_response(
     status_code: int,
     code: str,

@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     jwt_audience: str = Field(default="synthora-clients", min_length=1)
     access_token_expire_minutes: int = Field(default=30, ge=5, le=1440)
 
+    # --- Paper file storage ---
+    # Relative paths are resolved against the PROJECT ROOT (not the current working
+    # directory), so uvicorn/pytest started from backend/ use the same location.
+    paper_storage_dir: Path = Path("storage")
+    # Mebibytes (1 MB = 1024 * 1024 bytes).
+    max_upload_size_mb: int = Field(default=25, ge=1, le=512)
+
     @field_validator("jwt_secret_key")
     @classmethod
     def _reject_placeholder_secret(cls, value: SecretStr) -> SecretStr:
@@ -94,6 +101,17 @@ class Settings(BaseSettings):
     @property
     def docs_enabled(self) -> bool:
         return self.environment != "production"
+
+    @property
+    def paper_storage_root(self) -> Path:
+        root = self.paper_storage_dir.expanduser()
+        if not root.is_absolute():
+            root = PROJECT_ROOT / root
+        return root.resolve()
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return self.max_upload_size_mb * 1024 * 1024
 
 
 @lru_cache

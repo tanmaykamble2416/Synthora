@@ -48,9 +48,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 
 @pytest.fixture
-def unit_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def unit_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     for key, value in UNIT_ENV.items():
         monkeypatch.setenv(key, value)
+    # Never let a test touch the real storage directory.
+    monkeypatch.setenv("PAPER_STORAGE_DIR", str(tmp_path / "paper-storage"))
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

@@ -58,7 +58,42 @@ class PaperRepository:
         )
         return (await self._session.execute(stmt)).scalar_one_or_none()
 
-    async def delete_owned(self, paper_id: uuid.UUID, owner_id: uuid.UUID) -> bool:
-        # Sections and chunks are removed by ON DELETE CASCADE.
-        stmt = delete(Paper).where(Paper.id == paper_id, _owned_by(owner_id)).returning(Paper.id)
-        return (await self._session.execute(stmt)).scalar_one_or_none() is not None
+    async def delete_owned(self, paper_id: uuid.UUID, owner_id: uuid.UUID) -> str | None:
+        """Delete the paper row; return its storage_key, or None if not found/not owned.
+        Sections and chunks are removed by ON DELETE CASCADE."""
+        stmt = delete(Paper).where(Paper.id == paper_id, _owned_by(owner_id)).returning(Paper.storage_key)
+        return (await self._session.execute(stmt)).scalar_one_or_none()
+
+    async def sha256_exists_in_owned_workspace(
+        self, workspace_id: uuid.UUID, owner_id: uuid.UUID, sha256: str
+    ) -> bool:
+        """Fast duplicate pre-check. The UNIQUE (workspace_id, sha256) constraint remains
+        the real guarantee for concurrent uploads."""
+        stmt = select(
+            select(Paper.id)
+            .where(Paper.workspace_id == workspace_id, Paper.sha256 == sha256, _owned_by(owner_id))
+            .exists()
+        )
+        return bool((await self._session.execute(stmt)).scalar_one())
+
+    async def create(
+        self,
+        *,
+        workspace_id: uuid.UUID,
+        original_filename: str,
+        storage_key: str,
+        sha256: str,
+        file_size_bytes: int,
+    ) -> Paper:
+        # Status defaults to 'uploaded'; page_count and bibliographic metadata stay NULL
+        # until extraction (Day 5). Nothing is guessed.
+        paper = Paper(
+            workspace_id=workspace_id,
+            original_filename=original_filename,
+            storage_key=storage_key,
+            sha256=sha256,
+            file_size_bytes=file_size_bytes,
+        )
+        self._session.add(paper)
+        await self._session.flush()
+        return paper

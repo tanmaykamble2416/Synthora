@@ -1,8 +1,8 @@
 # SYNTHORA
 
-AI-powered research intelligence and literature review platform.
+AI-powered research intelligence and literature review platform. *Intelligence Beyond Papers.*
 
-> Status: **Day 3: paper management API** (pending local verification). Day 2 verified.
+> Status: **Day 4: secure PDF upload and file storage** (pending local verification). Days 1–3 verified.
 > Formerly RESEARCHMIND. Only the branding changed: the Docker Compose project, container,
 > database name, database user and volume keep the `researchmind` names on purpose
 > (renaming the Compose project would create a new, empty volume).
@@ -47,6 +47,15 @@ uvicorn app.main:app --reload    # Swagger UI: http://127.0.0.1:8000/docs
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
+## Configuration (paper storage)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PAPER_STORAGE_DIR` | `storage` | Root directory for uploaded PDFs. A relative path is resolved against the **project root** (the folder that holds `.env`), not the current directory, so `uvicorn` and `pytest` started from `backend/` use the same place. An absolute path is used as is. |
+| `MAX_UPLOAD_SIZE_MB` | `25` | Maximum size of one PDF, in MB (1 MB = 1,048,576 bytes). Allowed range: 1–512. |
+
+`storage/` is ignored by Git, and so are `*.pdf` and `*.part` files anywhere in the repo.
+
 ## Database migrations (Alembic)
 
 Run these from `backend/`. Alembic reads the connection settings from the root `.env`; there are no credentials in `alembic.ini`.
@@ -65,17 +74,19 @@ only while it holds nothing you need. Downgrade never drops the `vector` extensi
 
 ```powershell
 # Unit tests: no database needed
-pytest
+python -m pytest
 
 # Integration tests: ONLY touch TEST_POSTGRES_DB (default researchmind_test)
-$env:RUN_DB_TESTS=1; pytest; Remove-Item Env:RUN_DB_TESTS
+$env:RUN_DB_TESTS="1"; python -m pytest; Remove-Item Env:RUN_DB_TESTS
 ```
 
-How the development database is kept safe from tests:
+How the development database and files are kept safe from tests:
 - the test DB name must end in `_test`, differ from `POSTGRES_DB` and be a plain identifier, or the run aborts;
 - `researchmind_test` is created inside the existing container if missing, and no database is ever dropped;
 - data is reset with `TRUNCATE`, and only on the test DB;
-- the integration suite runs the migration round trip (`upgrade → downgrade → upgrade`) and `alembic check` on the test DB.
+- the integration suite runs the migration round trip (`upgrade → downgrade → upgrade`) and `alembic check` on the test DB;
+- every test that stores files gets its own temporary storage directory outside the project, and a fixture
+  asserts this, so tests never write to your real `storage/`.
 
 ## API (v1)
 
@@ -88,21 +99,92 @@ How the development database is kept safe from tests:
 | GET / PATCH / DELETE | `/api/v1/users/me` | Bearer | Own account only |
 | POST / GET | `/api/v1/workspaces` | Bearer | Create / list own workspaces (`limit`, `offset`) |
 | GET / PATCH / DELETE | `/api/v1/workspaces/{id}` | Bearer | Own workspace only (others' → 404) |
+| **POST** | `/api/v1/workspaces/{id}/papers` | Bearer | **Upload a PDF** (multipart field `file`) → 201 + `Location` header |
 | GET | `/api/v1/workspaces/{id}/papers` | Bearer | List papers in own workspace (`limit` ≤ 100, `offset`; newest first) |
 | GET | `/api/v1/papers/{id}` | Bearer | Own paper only (others' → 404) |
 | PATCH | `/api/v1/papers/{id}` | Bearer | Edit `title`, `abstract`, `authors`, `publication_year`, `doi` only |
-| DELETE | `/api/v1/papers/{id}` | Bearer | Deletes the DB record (stored PDF removal arrives with the Day 4/5 storage service) |
+| DELETE | `/api/v1/papers/{id}` | Bearer | Delete the paper record, its sections/chunks and its stored PDF |
 
-There is no paper upload endpoint yet (Day 4). Until then, exercise the paper endpoints with
-demo rows (see "Manual testing" below).
-
-Paper responses never include `storage_key` (server file location) or `error_message`
-(raw processing errors). Both stay in the database for server-side use; a failed paper is
+Paper responses never include `storage_key` (server file location), `error_message` (raw processing
+errors) or any filesystem path. Both fields stay in the database for server-side use; a failed paper is
 visible to its owner as `"status": "failed"`.
 
 Errors always look like `{"error": {"code", "message", "details"}}`.
 
+## PDF upload
+
+`POST /api/v1/workspaces/{workspace_id}/papers`, `multipart/form-data` with exactly one file part named `file`.
+No other form fields are accepted.
+
+**Order of checks** (the body is read only after steps 1–2 pass):
+
+| # | Check | Failure |
+|---|---|---|
+| 1 | Bearer token valid | 401 `AUTHENTICATION_FAILED` |
+| 2 | Workspace exists and belongs to you (SQL-scoped) | 404 `NOT_FOUND` |
+| 3 | Declared `Content-Length` ≤ limit + 64 KiB multipart overhead | 413 `PAYLOAD_TOO_LARGE` |
+| 4 | Body is `multipart/form-data` with one file in `file` | 415 / 400 |
+| 5 | Bytes actually received ≤ limit + 64 KiB (counted, `Content-Length` not trusted) | 413 |
+| 6 | Filename ends in `.pdf` (any case), after sanitising | 415 `UNSUPPORTED_MEDIA_TYPE` |
+| 7 | Declared MIME is `application/pdf`, `application/octet-stream` or absent | 415 |
+| 8 | Content starts with `%PDF-<digit>.<digit>` at byte 0 | 400 `BAD_REQUEST` |
+| 9 | File not empty, file ≤ `MAX_UPLOAD_SIZE_MB` (counted per 1 MiB chunk) | 400 / 413 |
+| 10 | Same SHA-256 not already in this workspace | 409 `CONFLICT` |
+
+**Accepted files.** PDFs only. The extension and MIME type are only filters; the `%PDF-` signature in the
+content decides. `application/octet-stream` (sent by some clients when the type is unknown) is accepted
+**only** because the signature check still has to pass.
+
+**Strict signature policy (intentional).** The header must be at byte 0, as the PDF standard (ISO 32000)
+requires. Some PDF readers tolerate up to 1 KB of junk before `%PDF-`, but leading bytes are how "polyglot"
+files hide a second format (HTML, ZIP, script) in front of a PDF. Academic PDFs from arXiv and publishers
+start at byte 0. A file with leading bytes is rejected with 400.
+
+**Filenames.** The original name is stored as metadata only (`original_filename`): basename only (client paths
+like `C:\Users\…\x.pdf` or `../../x.pdf` are reduced to `x.pdf`), control and bidi characters removed (blocks
+`invoice<U+202E>fdp.exe` spoofing), at most 255 characters. It is **never** used on disk.
+
+**Duplicates.** SHA-256 is computed by the server while streaming (any client-sent hash is ignored).
+The same PDF in the same workspace returns 409. The same PDF in a different workspace is allowed and stored
+as a separate file. A fast pre-check catches most duplicates; concurrent uploads that race past it are stopped
+by the database constraint `UNIQUE (workspace_id, sha256)` and also return 409.
+
+**What is stored.** A `papers` row with `status = "uploaded"`, the real size and SHA-256, and the original
+filename. `page_count`, `title`, `authors` and the other metadata stay `null` until extraction (Day 5).
+Nothing is guessed.
+
+## File storage architecture
+
+```
+<PAPER_STORAGE_DIR>/
+├── papers/YYYY/MM/<uuid4>.pdf          permanent files; the storage key is this relative path
+├── .tmp/<random>.part                  uploads in progress (same volume, so the final move is atomic)
+└── .cleanup/pending-deletions.jsonl    files whose deletion failed, queued for retry
+```
+
+- **Server-generated keys only.** Every key must match `papers/<4 digits>/<01-12>/<uuid4>.pdf` before it
+  becomes a path. Then the resolved path must still be inside the root, which also defeats symlink escapes.
+  `..`, absolute paths, drive letters, backslashes, UNC paths and client-chosen names are all rejected.
+- **Upload lifecycle.** Stream to `.tmp/` (hash + size + signature checked chunk by chunk, never the whole file
+  in memory), duplicate pre-check, then an atomic `os.replace()` into `papers/…`, then INSERT + COMMIT.
+  If anything fails before the move, the temp file is removed. If the INSERT/COMMIT fails after the move
+  (including a duplicate race or a client disconnect), the new permanent file is removed again.
+- **Deletion.** `DELETE /papers/{id}` deletes the row (sections and chunks cascade) and **commits first**,
+  then removes the file. If removing the file fails (e.g. a Windows file lock), the API still returns 204
+  with no internal details. The failure is logged, and the key is appended to
+  `.cleanup/pending-deletions.jsonl`. The row is never recreated. Retry later with:
+
+  ```powershell
+  cd D:\Projects\Synthora\backend; .\.venv\Scripts\Activate.ps1
+  python -c "from app.core.config import get_settings; from app.services.storage_service import StorageService; print(StorageService(get_settings().paper_storage_root).retry_pending_deletions())"
+  ```
+
+- **No file contents in PostgreSQL.** Only metadata and the key.
+
 ## Manual testing (Swagger UI)
+
+You need one or two real PDF files (any paper), a non-PDF file (e.g. a `.txt`), and optionally a copy of a
+PDF renamed to `.txt`.
 
 ### 1. Start the stack
 
@@ -114,53 +196,45 @@ alembic current                                  # expect: 0001 (head)
 uvicorn app.main:app --reload                    # open http://127.0.0.1:8000/docs
 ```
 
-### 2. Create a user and log in
+### 2. Create a user, log in, create a workspace
 1. `POST /api/v1/auth/register` with `{"email": "demo@example.com", "password": "demo-password-123"}` → 201.
-2. Click **Authorize** (top right). Enter username = `demo@example.com` and password = `demo-password-123`, then click **Authorize**. Swagger now sends the bearer token on every request.
-3. `GET /api/v1/users/me` → 200 with your account.
+2. Click **Authorize** (top right). Enter username = `demo@example.com` and password = `demo-password-123`, then click **Authorize**.
+3. `POST /api/v1/workspaces` with `{"name": "Demo Survey"}` → 201. Copy the `id`.
 
-### 3. Create a workspace
-`POST /api/v1/workspaces` with `{"name": "Demo Survey"}` → 201. Copy the returned `id`.
+### 3. Upload
+In `POST /api/v1/workspaces/{workspace_id}/papers`, click **Try it out**, paste the workspace id, choose a file for `file`, then click **Execute**.
 
-### 4. Seed demo papers (until the Day 4 upload endpoint exists)
-This **adds rows to the development database**. It deletes nothing, and it can be re-run
-(it generates unique keys; each run adds 3 more rows, and the table below assumes one run).
-In a **second** PowerShell window, from the repo root:
+| Step | What to send | Expected |
+|---|---|---|
+| Upload a real PDF | `paper.pdf` | 201. `status: "uploaded"`, `page_count: null`, correct `file_size_bytes`, a 64-char `sha256`. **No** `storage_key` / `error_message`. A new file appears under `D:\Projects\Synthora\storage\papers\YYYY\MM\<uuid>.pdf` |
+| Same PDF again | same file | 409 `CONFLICT` |
+| Same PDF, other workspace | create a 2nd workspace, upload there | 201 |
+| Non-PDF | `notes.txt` | 415 `UNSUPPORTED_MEDIA_TYPE` |
+| Fake PDF | a text file renamed to `fake.pdf` | 400 `BAD_REQUEST` ("does not start with a %PDF- header") |
+| Empty | an empty file named `empty.pdf` | 400 |
+| Too big | set `MAX_UPLOAD_SIZE_MB=1` in `.env`, restart uvicorn, upload a PDF over 1 MB | 413 `PAYLOAD_TOO_LARGE` (set it back afterwards) |
+| No token | **Authorize → Logout**, upload | 401 |
 
-```powershell
-$ws = "PASTE-WORKSPACE-ID-HERE"
-docker compose exec postgres psql -U researchmind -d researchmind -c "INSERT INTO papers (workspace_id, original_filename, storage_key, sha256, file_size_bytes, title, status, error_message, created_at) SELECT '$ws', v.fname, 'manual/' || gen_random_uuid() || '.pdf', encode(sha256(gen_random_uuid()::text::bytea), 'hex'), 1024, v.title, v.status, v.err, now() - v.age FROM (VALUES ('attention.pdf', 'Attention Is All You Need', 'uploaded', NULL, interval '2 minutes'), ('bert.pdf', 'BERT', 'uploaded', NULL, interval '1 minute'), ('broken.pdf', 'Broken upload', 'failed', 'Traceback: /srv/internal/path.pdf', interval '0 minutes')) AS v(fname, title, status, err, age) RETURNING id, title, status;"
-```
-
-### 5. Exercise the paper endpoints
-
+### 4. Read, update, delete
 | Step | Request | Expected |
 |---|---|---|
-| List | `GET /api/v1/workspaces/{id}/papers` | 200: 3 items, newest first (`Broken upload`, `BERT`, `Attention…`), `total: 3`. **No** `storage_key` / `error_message` keys; the broken one shows `"status": "failed"` |
-| Paginate | same, `limit=2&offset=2` | 200: 1 item, `total: 3` |
-| Bad pagination | same, `limit=101` or `offset=-1` | 422 `VALIDATION_ERROR` |
+| List | `GET /api/v1/workspaces/{id}/papers` | 200, newest first, `total` correct, no internal fields |
 | Get | `GET /api/v1/papers/{paper_id}` | 200 |
-| Update | `PATCH /api/v1/papers/{paper_id}` with `{"publication_year": 2017, "doi": "https://doi.org/10.48550/arXiv.1706.03762", "authors": [{"name": "Ashish Vaswani", "affiliation": "Google Brain"}]}` | 200, `doi` normalised to `10.48550/arXiv.1706.03762` |
-| Clear | `PATCH` with `{"doi": null}` | 200, `doi: null` |
+| Update | `PATCH /api/v1/papers/{paper_id}` with `{"publication_year": 2017, "doi": "https://doi.org/10.48550/arXiv.1706.03762"}` | 200, `doi` normalised to `10.48550/arXiv.1706.03762` |
 | Internal field | `PATCH` with `{"status": "processed"}` or `{"storage_key": "x"}` | 422 (whole request rejected) |
-| Empty body | `PATCH` with `{}` | 422 |
-| Bad year | `PATCH` with `{"publication_year": 1700}` | 422 |
-| Delete | `DELETE /api/v1/papers/{paper_id}` | 204, then `GET` on it → 404 |
-| Bad id | `GET /api/v1/papers/not-a-uuid` | 422 |
-| No token | Click **Authorize → Logout**, then `GET /api/v1/papers/{paper_id}` | 401 |
+| Delete | `DELETE /api/v1/papers/{paper_id}` | 204. Then `GET` → 404, and the file under `storage\papers\…` is gone |
 
-### 6. Check cross-user isolation
-Log out, register `other@example.com`, and authorize as that user. Then `GET`, `PATCH` and `DELETE`
-on one of the demo user's `paper_id`s, and `GET /api/v1/workspaces/{demo-workspace-id}/papers`.
-All must return **404** with the same body as a paper that doesn't exist. Log back in as the demo user
-and confirm nothing changed.
+### 5. Cross-user isolation
+Log out, register `other@example.com` and authorize as that user. Then:
+- upload into the demo user's workspace;
+- `GET`, `PATCH` and `DELETE` one of the demo user's papers.
 
-### 7. Clean up the demo rows (optional)
-Use `DELETE /api/v1/papers/{id}` in Swagger, or remove only the seeded rows:
+All must return **404**, and the demo user's file must still be on disk.
 
-```powershell
-docker compose exec postgres psql -U researchmind -d researchmind -c "DELETE FROM papers WHERE storage_key LIKE 'manual/%' RETURNING id, title;"
-```
+### 6. Clean up
+Delete demo papers with `DELETE /api/v1/papers/{id}`, which removes the files too. Rows seeded by hand
+during Day 3 testing (keys starting `manual/`) have no file. Deleting them works and logs
+"invalid storage key; nothing was deleted" on the server.
 
 ## Notes
 
