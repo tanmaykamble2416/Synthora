@@ -46,7 +46,9 @@ class Paper(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Metadata filled by GROBID on Day 5. Nullable: never invented.
     title: Mapped[str | None] = mapped_column(Text)
     abstract: Mapped[str | None] = mapped_column(Text)
-    authors: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    # none_as_null: Python None is stored as SQL NULL, not the JSON value 'null',
+    # so "authors IS NULL" reliably means "no authors known". (No DDL change.)
+    authors: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB(none_as_null=True))
     publication_year: Mapped[int | None] = mapped_column(SmallInteger)
     doi: Mapped[str | None] = mapped_column(String(255))
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

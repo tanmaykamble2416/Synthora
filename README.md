@@ -2,7 +2,7 @@
 
 AI-powered research intelligence and literature review platform.
 
-> Status: **Day 2: database architecture, migrations and JWT auth** (pending local verification).
+> Status: **Day 3: paper management API** (pending local verification). Day 2 verified.
 > Formerly RESEARCHMIND. Only the branding changed: the Docker Compose project, container,
 > database name, database user and volume keep the `researchmind` names on purpose
 > (renaming the Compose project would create a new, empty volume).
@@ -88,8 +88,79 @@ How the development database is kept safe from tests:
 | GET / PATCH / DELETE | `/api/v1/users/me` | Bearer | Own account only |
 | POST / GET | `/api/v1/workspaces` | Bearer | Create / list own workspaces (`limit`, `offset`) |
 | GET / PATCH / DELETE | `/api/v1/workspaces/{id}` | Bearer | Own workspace only (others' → 404) |
+| GET | `/api/v1/workspaces/{id}/papers` | Bearer | List papers in own workspace (`limit` ≤ 100, `offset`; newest first) |
+| GET | `/api/v1/papers/{id}` | Bearer | Own paper only (others' → 404) |
+| PATCH | `/api/v1/papers/{id}` | Bearer | Edit `title`, `abstract`, `authors`, `publication_year`, `doi` only |
+| DELETE | `/api/v1/papers/{id}` | Bearer | Deletes the DB record (stored PDF removal arrives with the Day 4/5 storage service) |
+
+There is no paper upload endpoint yet (Day 4). Until then, exercise the paper endpoints with
+demo rows (see "Manual testing" below).
+
+Paper responses never include `storage_key` (server file location) or `error_message`
+(raw processing errors). Both stay in the database for server-side use; a failed paper is
+visible to its owner as `"status": "failed"`.
 
 Errors always look like `{"error": {"code", "message", "details"}}`.
+
+## Manual testing (Swagger UI)
+
+### 1. Start the stack
+
+```powershell
+cd D:\Projects\Synthora
+docker compose up -d; docker compose ps          # postgres must be "healthy"
+cd backend; .\.venv\Scripts\Activate.ps1
+alembic current                                  # expect: 0001 (head)
+uvicorn app.main:app --reload                    # open http://127.0.0.1:8000/docs
+```
+
+### 2. Create a user and log in
+1. `POST /api/v1/auth/register` with `{"email": "demo@example.com", "password": "demo-password-123"}` → 201.
+2. Click **Authorize** (top right). Enter username = `demo@example.com` and password = `demo-password-123`, then click **Authorize**. Swagger now sends the bearer token on every request.
+3. `GET /api/v1/users/me` → 200 with your account.
+
+### 3. Create a workspace
+`POST /api/v1/workspaces` with `{"name": "Demo Survey"}` → 201. Copy the returned `id`.
+
+### 4. Seed demo papers (until the Day 4 upload endpoint exists)
+This **adds rows to the development database**. It deletes nothing, and it can be re-run
+(it generates unique keys; each run adds 3 more rows, and the table below assumes one run).
+In a **second** PowerShell window, from the repo root:
+
+```powershell
+$ws = "PASTE-WORKSPACE-ID-HERE"
+docker compose exec postgres psql -U researchmind -d researchmind -c "INSERT INTO papers (workspace_id, original_filename, storage_key, sha256, file_size_bytes, title, status, error_message, created_at) SELECT '$ws', v.fname, 'manual/' || gen_random_uuid() || '.pdf', encode(sha256(gen_random_uuid()::text::bytea), 'hex'), 1024, v.title, v.status, v.err, now() - v.age FROM (VALUES ('attention.pdf', 'Attention Is All You Need', 'uploaded', NULL, interval '2 minutes'), ('bert.pdf', 'BERT', 'uploaded', NULL, interval '1 minute'), ('broken.pdf', 'Broken upload', 'failed', 'Traceback: /srv/internal/path.pdf', interval '0 minutes')) AS v(fname, title, status, err, age) RETURNING id, title, status;"
+```
+
+### 5. Exercise the paper endpoints
+
+| Step | Request | Expected |
+|---|---|---|
+| List | `GET /api/v1/workspaces/{id}/papers` | 200: 3 items, newest first (`Broken upload`, `BERT`, `Attention…`), `total: 3`. **No** `storage_key` / `error_message` keys; the broken one shows `"status": "failed"` |
+| Paginate | same, `limit=2&offset=2` | 200: 1 item, `total: 3` |
+| Bad pagination | same, `limit=101` or `offset=-1` | 422 `VALIDATION_ERROR` |
+| Get | `GET /api/v1/papers/{paper_id}` | 200 |
+| Update | `PATCH /api/v1/papers/{paper_id}` with `{"publication_year": 2017, "doi": "https://doi.org/10.48550/arXiv.1706.03762", "authors": [{"name": "Ashish Vaswani", "affiliation": "Google Brain"}]}` | 200, `doi` normalised to `10.48550/arXiv.1706.03762` |
+| Clear | `PATCH` with `{"doi": null}` | 200, `doi: null` |
+| Internal field | `PATCH` with `{"status": "processed"}` or `{"storage_key": "x"}` | 422 (whole request rejected) |
+| Empty body | `PATCH` with `{}` | 422 |
+| Bad year | `PATCH` with `{"publication_year": 1700}` | 422 |
+| Delete | `DELETE /api/v1/papers/{paper_id}` | 204, then `GET` on it → 404 |
+| Bad id | `GET /api/v1/papers/not-a-uuid` | 422 |
+| No token | Click **Authorize → Logout**, then `GET /api/v1/papers/{paper_id}` | 401 |
+
+### 6. Check cross-user isolation
+Log out, register `other@example.com`, and authorize as that user. Then `GET`, `PATCH` and `DELETE`
+on one of the demo user's `paper_id`s, and `GET /api/v1/workspaces/{demo-workspace-id}/papers`.
+All must return **404** with the same body as a paper that doesn't exist. Log back in as the demo user
+and confirm nothing changed.
+
+### 7. Clean up the demo rows (optional)
+Use `DELETE /api/v1/papers/{id}` in Swagger, or remove only the seeded rows:
+
+```powershell
+docker compose exec postgres psql -U researchmind -d researchmind -c "DELETE FROM papers WHERE storage_key LIKE 'manual/%' RETURNING id, title;"
+```
 
 ## Notes
 
