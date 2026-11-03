@@ -30,7 +30,7 @@ from tests.conftest import TEST_JWT_SECRET
 from tests.db_safety import assert_safe_test_database
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
-APP_TABLES = ("paper_chunks", "paper_sections", "papers", "workspaces", "users")
+APP_TABLES = ("paper_pages", "paper_chunks", "paper_sections", "papers", "workspaces", "users")
 
 
 class _TestDatabaseSettings(BaseSettings):

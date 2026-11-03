@@ -2,7 +2,7 @@
 
 AI-powered research intelligence and literature review platform. *Intelligence Beyond Papers.*
 
-> Status: **Day 4: secure PDF upload and file storage** (pending local verification). Days 1–3 verified.
+> Status: **Day 5: PDF text extraction** (pending local verification). Days 1–4 verified.
 > Formerly RESEARCHMIND. Only the branding changed: the Docker Compose project, container,
 > database name, database user and volume keep the `researchmind` names on purpose
 > (renaming the Compose project would create a new, empty volume).
@@ -47,12 +47,14 @@ uvicorn app.main:app --reload    # Swagger UI: http://127.0.0.1:8000/docs
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-## Configuration (paper storage)
+## Configuration (paper storage and extraction)
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PAPER_STORAGE_DIR` | `storage` | Root directory for uploaded PDFs. A relative path is resolved against the **project root** (the folder that holds `.env`), not the current directory, so `uvicorn` and `pytest` started from `backend/` use the same place. An absolute path is used as is. |
 | `MAX_UPLOAD_SIZE_MB` | `25` | Maximum size of one PDF, in MB (1 MB = 1,048,576 bytes). Allowed range: 1–512. |
+| `EXTRACTION_MAX_PAGES` | `2000` | PDFs with more pages fail with `too_many_pages`. Allowed range: 1–20000. |
+| `EXTRACTION_STALE_MINUTES` | `15` | A paper left in `processing` longer than this (e.g. after a server crash) can be extracted again. |
 
 `storage/` is ignored by Git, and so are `*.pdf` and `*.part` files anywhere in the repo.
 
@@ -103,7 +105,10 @@ How the development database and files are kept safe from tests:
 | GET | `/api/v1/workspaces/{id}/papers` | Bearer | List papers in own workspace (`limit` ≤ 100, `offset`; newest first) |
 | GET | `/api/v1/papers/{id}` | Bearer | Own paper only (others' → 404) |
 | PATCH | `/api/v1/papers/{id}` | Bearer | Edit `title`, `abstract`, `authors`, `publication_year`, `doi` only |
-| DELETE | `/api/v1/papers/{id}` | Bearer | Delete the paper record, its sections/chunks and its stored PDF |
+| DELETE | `/api/v1/papers/{id}` | Bearer | Delete the paper record, its pages/sections/chunks and its stored PDF |
+| **POST** | `/api/v1/papers/{id}/extract` | Bearer | **Extract the text of every page** → 200 `ExtractionSummary` (409 if already running) |
+| GET | `/api/v1/papers/{id}/pages` | Bearer | Extracted pages in page order (`limit` ≤ 50, `offset`) |
+| GET | `/api/v1/papers/{id}/pages/{page_number}` | Bearer | One extracted page (1-based) |
 
 Paper responses never include `storage_key` (server file location), `error_message` (raw processing
 errors) or any filesystem path. Both fields stay in the database for server-side use; a failed paper is
@@ -153,6 +158,111 @@ by the database constraint `UNIQUE (workspace_id, sha256)` and also return 409.
 filename. `page_count`, `title`, `authors` and the other metadata stay `null` until extraction (Day 5).
 Nothing is guessed.
 
+## PDF text extraction
+
+`POST /api/v1/papers/{paper_id}/extract` reads the stored PDF with **PyMuPDF** and saves the text of
+**every page** as its own row in `paper_pages`, numbered from 1 exactly as in the PDF. Extraction is manual
+and synchronous for now (automatic background processing arrives with Celery on Day 10).
+
+### Workflow
+
+```
+POST /papers/{id}/extract
+  ├─ T1 claim     UPDATE papers SET status='processing' WHERE id, owned, claimable RETURNING storage_key
+  │               + delete old pages, sections and chunks                                   COMMIT
+  ├─ extract      StorageService.resolve(storage_key) → pymupdf, page by page   (thread pool, NO transaction open)
+  │               clean text → classify page → PageExtraction(page_number, text, counts, status, needs_ocr)
+  └─ T2 persist   SELECT … FOR UPDATE; still 'processing'? → one batched INSERT of all pages
+                  + status='processed', page_count, processed_at                            COMMIT
+     or T2 fail   status='failed', failure_code, internal error_message                    COMMIT
+```
+
+- **Short transactions.** T1 and T2 take milliseconds. The PDF work happens between them, with no
+  database transaction or row lock held.
+- **Atomic pages.** All pages of an extraction are written in one transaction or not at all. A failed or
+  interrupted extraction never leaves old or partial pages behind: pages exist only while the paper's
+  latest extraction has completed (`processed`).
+- **Re-extraction** replaces every page. `UNIQUE (paper_id, page_number)` makes duplicate pages impossible,
+  and derived `paper_sections` / `paper_chunks` are cleared because they would be stale.
+- **One extraction per paper at a time.** The T1 conditional UPDATE acts as the lock, and a second
+  request gets **409**. A claim older than `EXTRACTION_STALE_MINUTES` (judged by `papers.updated_at`, which
+  the claim sets to the database's `now()`) can be taken over after a crash.
+
+### Processing lifecycle
+
+```
+uploaded ──extract──▶ processing ──▶ processed     (pages saved; some may be flagged needs_ocr)
+                          │
+                          └────────▶ failed        (failure_code set; no pages)
+processed / failed ──extract again──▶ processing …
+```
+
+### What a page looks like
+
+| Field | Meaning |
+|---|---|
+| `page_number` | 1-based, exactly as in the PDF. Blank pages are kept, so numbers never shift. |
+| `text` | Extracted text after conservative cleaning (see below). `""` if the page has no text layer. |
+| `char_count`, `word_count` | Of the stored text. |
+| `extraction_status` | `text` (≥ 50 non-space characters), `low_text` (1–49) or `empty` (0). |
+| `needs_ocr` | `true` when the page has images but not enough text, i.e. it is probably scanned. **No OCR is performed.** |
+
+A PDF that is **entirely scanned** is still `processed`: every page is saved with `text = ""` and
+`needs_ocr = true`. Nothing is invented.
+
+### Handled failures (HTTP 200, `status: "failed"`)
+
+| `failure_code` | Cause |
+|---|---|
+| `file_missing` | The stored file is gone, or the row's storage key is not a server-generated key (e.g. hand-seeded rows) |
+| `pdf_corrupted` | PyMuPDF cannot open the file, or it has no pages |
+| `pdf_encrypted` | The PDF needs a password to open. Owner-password-only PDFs (permission restrictions) open and are extracted. |
+| `too_many_pages` | More than `EXTRACTION_MAX_PAGES` pages |
+| `extraction_error` | **Any** page could not be read. The whole extraction fails rather than presenting partial content as complete. |
+
+`no_extractable_text` is a reserved code; it is not used today (scanned PDFs are `processed`).
+The technical detail goes to the server log and the internal `papers.error_message` column, never to the
+client. Unexpected errors (bugs) return the generic **500** and also mark the paper `failed` /
+`extraction_error`, so it is never left stuck in `processing`.
+
+### Text cleaning (conservative)
+
+Removed or normalised:
+- NUL (MuPDF's marker for an unmappable glyph) and other control characters;
+- soft hyphens, zero-width spaces and BOMs;
+- CRLF/CR, which become LF;
+- runs of spaces and tabs (collapsed), and spaces at line ends;
+- three or more blank lines, which become one blank line, so paragraph breaks survive;
+- Unicode, normalised to NFC.
+
+Ligatures (`ﬁ` → `fi`) are expanded by MuPDF itself.
+
+**Never** done: NFKC (it would turn `x²` into `x2` and `ℝ` into `R`), de-hyphenation, joining lines,
+reflowing, spell-checking or any rewriting. Numbers, percentages, citation markers like `[12]` and maths
+symbols are kept byte for byte.
+
+### Extraction limitations
+
+- **No OCR.** Scanned pages are detected and flagged `needs_ocr`; their text stays empty.
+- **Reading order** follows the PDF content stream, which is usually correct for LaTeX two-column papers
+  but not guaranteed for every PDF. Position-sorting is deliberately not used, because it interleaves columns.
+- **Tables** keep every cell and number, one cell per line, but lose their grid layout.
+- **Maths** is only as good as the PDF's text layer. Glyphs without a Unicode mapping are dropped (MuPDF reports
+  them as NUL), never guessed.
+- **One extraction at a time per server process.** PyMuPDF is not thread-safe, so extractions are serialised
+  by a process-wide lock. Day 10 moves extraction to Celery worker processes.
+- The request waits until extraction finishes. That's fine for typical papers (well under a second in tests),
+  but slow for very large documents until Day 10.
+- If the client disconnects mid-extraction, the paper can stay `processing` until `EXTRACTION_STALE_MINUTES`
+  has passed, after which it can be re-extracted.
+
+### Licence: PyMuPDF is AGPL-3.0
+
+PyMuPDF (`PyMuPDF==1.28.2`, imported as `pymupdf`) is dual-licensed: **GNU AGPL-3.0** or a commercial
+licence from Artifex. Using it in this open portfolio project is fine. **Distributing or offering SYNTHORA as
+a network service commercially** requires either complying with the AGPL (publishing the complete source
+of the service) or buying an Artifex licence.
+
 ## File storage architecture
 
 ```
@@ -184,7 +294,7 @@ Nothing is guessed.
 ## Manual testing (Swagger UI)
 
 You need one or two real PDF files (any paper), a non-PDF file (e.g. a `.txt`), and optionally a copy of a
-PDF renamed to `.txt`.
+PDF renamed to `.txt`. For extraction checks, a scanned PDF (image-only) and a password-protected PDF are useful too.
 
 ### 1. Start the stack
 
@@ -192,7 +302,9 @@ PDF renamed to `.txt`.
 cd D:\Projects\Synthora
 docker compose up -d; docker compose ps          # postgres must be "healthy"
 cd backend; .\.venv\Scripts\Activate.ps1
-alembic current                                  # expect: 0001 (head)
+pip install -r requirements-dev.txt              # Day 5 adds PyMuPDF
+alembic upgrade head                             # applies 0002 (paper_pages, failure_code)
+alembic current                                  # expect: 0002 (head)
 uvicorn app.main:app --reload                    # open http://127.0.0.1:8000/docs
 ```
 
@@ -224,15 +336,27 @@ In `POST /api/v1/workspaces/{workspace_id}/papers`, click **Try it out**, paste 
 | Internal field | `PATCH` with `{"status": "processed"}` or `{"storage_key": "x"}` | 422 (whole request rejected) |
 | Delete | `DELETE /api/v1/papers/{paper_id}` | 204. Then `GET` → 404, and the file under `storage\papers\…` is gone |
 
-### 5. Cross-user isolation
+### 5. Extract text
+| Step | Request | Expected |
+|---|---|---|
+| Extract | `POST /api/v1/papers/{paper_id}/extract` | 200, `status: "processed"`, `page_count` = the PDF's page count, sensible `total_words` |
+| Pages | `GET /api/v1/papers/{paper_id}/pages` | 200, pages `1, 2, 3, …` in order, text matches what you see in a PDF viewer |
+| One page | `GET /api/v1/papers/{paper_id}/pages/1` | 200. Page `0` → 422; a page beyond the end → 404 |
+| Paper | `GET /api/v1/papers/{paper_id}` | `status: "processed"`, `page_count` filled, `failure_code: null` |
+| Again | `POST …/extract` a second time | 200; `GET …/pages` still shows each page exactly once |
+| Scanned PDF | upload a scanned PDF (no text layer), extract | 200 `processed`, `needs_ocr_pages` = `page_count`, empty texts |
+| Encrypted PDF | upload a PDF with an open password, extract | 200 `status: "failed"`, `failure_code: "pdf_encrypted"`; `GET …/pages` → empty |
+
+### 6. Cross-user isolation
 Log out, register `other@example.com` and authorize as that user. Then:
 - upload into the demo user's workspace;
-- `GET`, `PATCH` and `DELETE` one of the demo user's papers.
+- `GET`, `PATCH` and `DELETE` one of the demo user's papers;
+- `POST …/extract`, `GET …/pages` and `GET …/pages/1` on one of the demo user's papers.
 
 All must return **404**, and the demo user's file must still be on disk.
 
-### 6. Clean up
-Delete demo papers with `DELETE /api/v1/papers/{id}`, which removes the files too. Rows seeded by hand
+### 7. Clean up
+Delete demo papers with `DELETE /api/v1/papers/{id}`, which removes the files and the extracted pages too. Rows seeded by hand
 during Day 3 testing (keys starting `manual/`) have no file. Deleting them works and logs
 "invalid storage key; nothing was deleted" on the server.
 

@@ -4,10 +4,167 @@ Tagline: Intelligence Beyond Papers.
 
 ---
 
+## Session: Day 5: PDF text extraction engine (2026-11-02)
+
+**Status: implemented and verified in Claude's Linux sandbox (PostgreSQL 16.15, PyMuPDF 1.28.2).
+PENDING: local verification on Windows + Docker Compose. Day 5 is not complete until that passes. Not committed.**
+
+### 1. Completed tasks
+- **Endpoints (owner-only, OpenAPI-documented):**
+  - `POST /api/v1/papers/{id}/extract`: returns 200 `ExtractionSummary` for every handled outcome (`processed`, or `failed` + `failure_code`); 409 if already running; 404 if not yours;
+  - `GET /api/v1/papers/{id}/pages` (paginated, limit ≤ 50);
+  - `GET /api/v1/papers/{id}/pages/{page_number}` (1-based).
+- **Extraction engine** (`pdf_extraction.py`): pure, synchronous, no DB or FastAPI imports, so it's reusable by a Day 10 Celery worker. It:
+  - opens the PDF with `with pymupdf.open(...)` (always closed) and enforces `EXTRACTION_MAX_PAGES`;
+  - extracts every page in content-stream order (not `sort=True`, which interleaves columns), 1-based, with ligatures expanded;
+  - classifies each page `text` / `low_text` / `empty` and sets `needs_ocr` when there are images but little text.
+- **Failure handling:**
+  - `file_missing`, `pdf_corrupted`, `pdf_encrypted` (user password; owner-only PDFs are extracted), `too_many_pages`;
+  - `extraction_error` when **any** page raises or is unreadable (MuPDF warnings + no text). The whole document fails; nothing partial is stored.
+- **Fully scanned PDF:** `processed`, all pages saved with `needs_ocr = true` (per the approved decision). No OCR.
+- **Text cleaner** (`pdf_text_cleaner.py`): conservative.
+  - Removes NUL/control characters, soft hyphens, ZWSP and BOM.
+  - Normalises line endings to LF, collapses whitespace runs and limits blank lines.
+  - Applies NFC.
+  - Explicitly **no** NFKC, de-hyphenation or rewriting.
+- **Orchestration** (`extraction_service.py`): three short transactions, with the PDF work outside any transaction:
+  - **T1** claim (conditional UPDATE = lock) + delete old pages/sections/chunks;
+  - **T2** `SELECT … FOR UPDATE` + one batched INSERT + mark processed;
+  - or **T2** mark failed.
+  - Unexpected errors → best-effort `failed`/`extraction_error`, then the generic 500.
+- **Thread safety:** PyMuPDF is not thread-safe and its warning store is process-global, so extraction is serialised by a process-wide lock and runs in the thread pool (the event loop is not blocked).
+- **`updated_at` verified** for stale recovery:
+  - the claim's UPDATE sets it to the DB `now()` (ORM `onupdate`), and a test proves it;
+  - the cutoff is computed in SQL (`now() - interval`), so app/DB clock skew doesn't matter.
+  - Caveat: a metadata PATCH during processing also bumps `updated_at`, which can only *delay* recovery, never cause an early takeover.
+- **Superseded results** (a stale takeover finished first) are discarded with 409, never written.
+- `PaperRead` now includes `failure_code`.
+
+### 2. Files
+**New:**
+- backend/alembic/versions/0002_paper_pages_and_failure_code.py
+- backend/app/models/paper_page.py
+- backend/app/repositories/paper_page_repository.py
+- backend/app/services/pdf_text_cleaner.py
+- backend/app/services/pdf_extraction.py
+- backend/app/services/extraction_service.py
+- backend/app/schemas/extraction.py
+- backend/app/api/v1/endpoints/extraction.py
+- backend/tests/pdf_factory.py (generates test PDFs in memory; no binary fixtures)
+- backend/tests/unit/test_pdf_text_cleaner.py
+- backend/tests/unit/test_pdf_extraction.py
+- backend/tests/integration/test_paper_extraction_api.py
+
+**Modified:**
+- backend/app/models/paper.py (`failure_code` + 2 CHECKs, `pages` relationship)
+- backend/app/models/__init__.py
+- backend/app/repositories/paper_repository.py:
+  - `owned_paper_ids`, `claim_for_extraction`, `delete_extracted_content`;
+  - `lock_status_for_update`, `mark_processed`, `mark_failed`;
+  - every one owner-scoped.
+- backend/app/schemas/paper.py (`failure_code` in `PaperRead`)
+- backend/app/api/v1/router.py
+- backend/app/core/config.py (`EXTRACTION_MAX_PAGES`, `EXTRACTION_STALE_MINUTES`)
+- backend/requirements.txt (`PyMuPDF==1.28.2`)
+- backend/tests/integration/conftest.py (`paper_pages` added to the TRUNCATE list)
+- backend/tests/integration/test_migrations.py (head is now `0002`; added a 0002 step-downgrade test and a constraint test)
+- .env.example, README.md, PROGRESS.md
+
+### 3. Architecture
+```
+endpoints/extraction.py ─▶ ExtractionService ─┬─▶ PaperRepository      (claim / lock / mark, owner-scoped SQL)
+                                              ├─▶ PaperPageRepository  (batched insert, owner-scoped reads)
+                                              ├─▶ StorageService.resolve(storage_key)
+                                              └─▶ pdf_extraction.extract_pdf  ─▶ pdf_text_cleaner
+                                                   (thread pool, process-wide MuPDF lock, no DB)
+```
+
+### 4. Database changes: migration `0002_paper_pages_and_failure_code`
+- **New table `paper_pages`:**
+  - columns: `paper_id` (FK → papers **ON DELETE CASCADE**), `page_number` (`CHECK ≥ 1`), `text` (NOT NULL, may be `''`), `char_count`/`word_count` (`CHECK ≥ 0`), `extraction_status` (`CHECK IN ('text','low_text','empty')`), `needs_ocr` (bool), timestamps;
+  - **`UNIQUE (paper_id, page_number)`**;
+  - ownership is inherited via papers → workspaces (like `paper_sections`).
+- **New column `papers.failure_code`** (VARCHAR(40), nullable), with two CHECKs:
+  - `failure_code_valid`: `file_missing`, `pdf_corrupted`, `pdf_encrypted`, `too_many_pages`, `no_extractable_text` (reserved), `extraction_error`;
+  - `failure_code_only_when_failed`: a code is only allowed when `status = 'failed'`.
+  - These CHECKs were **added by hand**: Alembic autogenerate does not detect new CHECK constraints on an existing table.
+- `paper_sections` and `paper_chunks` are **unchanged and not used** for page text. They are separate, overlapping divisions for Day 6–7.
+- **Verified in the sandbox**, on DBs that already held Day 4 rows:
+  - upgrade, then `alembic check` clean;
+  - the CHECK is enforced;
+  - downgrade to `0001` removes only the new objects, and existing papers survive;
+  - re-upgrade works.
+  - The Day 7 embeddings migration becomes `0003`.
+
+### 5. Dependencies introduced
+- **`PyMuPDF==1.28.2`** (no transitive dependencies; abi3 wheel for Windows x64 / Python 3.12 confirmed).
+  - **AGPL-3.0 or Artifex commercial**, documented in the README.
+  - 2.0 was not chosen: it's a two-week-old major release with no fixes we need.
+
+### 6. Known limitations
+- No OCR: scanned pages are flagged `needs_ocr` with empty text.
+- Reading order is the PDF content-stream order: right for typical LaTeX two-column papers, not guaranteed for all PDFs.
+- Tables keep cells and numbers (one per line), not their grid.
+- Maths is only as good as the PDF's text layer; unmappable glyphs (MuPDF NUL) are dropped, never guessed.
+- One extraction at a time per process (PyMuPDF thread-safety lock); requests wait for completion. Day 10 moves this to Celery processes.
+- A client disconnect mid-extraction can leave `processing` until `EXTRACTION_STALE_MINUTES` has passed; then it's reclaimable.
+- Stale-recovery edge case: if a slow original run *fails* after a takeover started, the paper ends `failed` even if the takeover would have succeeded. The user re-runs extraction. A dedicated claim token would remove this; it's not worth a column today.
+- `low_text` + images is flagged `needs_ocr`, which can include a figure page with a short caption (a "may need OCR" heuristic).
+- Rows seeded by hand during Day 3 (`manual/…` keys) extract as `file_missing`.
+
+### 7. Test results (Claude's sandbox; NOT yet your machine)
+Run in a **fresh** virtualenv installed from `requirements-dev.txt`:
+- `python -m compileall app`: OK.
+- `python -m pytest` (no DB): **213 passed, 246 skipped**.
+- `RUN_DB_TESTS=1 python -m pytest`: **459 passed, 0 failed**. That's the Day 4 baseline of 369, plus 52 unit tests, 36 extraction integration tests and 2 new migration tests.
+- `alembic check`: "No new upgrade operations detected."; head = `0002`.
+- The real `storage/` directory was never created; the dev DB sentinel was unchanged; no MuPDF messages leaked to stderr.
+- **Mutation checks**: 12 safety mechanisms, each removed in turn; every removal made at least one test fail. They were:
+  - unreadable-page detection, ligature expansion, the encryption check;
+  - stale-page deletion on claim, the superseded-result guard, rollback on persist failure;
+  - the owner filter on claim, page listing and single page;
+  - the stale cutoff, and `updated_at` refresh on claim.
+  - This exposed a gap (the page-listing owner filter was only covered via the service layer), now closed with a repository-level test.
+- **Live uvicorn smoke test:**
+  - upload → extract (200 processed, 4 pages, 1 `needs_ocr`) → page read;
+  - the log contained no extracted text, storage path or token.
+
+### 7a. Windows verification, run 1 (2026-11-02)
+- **Result:** 458 passed, **1 error**, in **29 min 18 s**. The error was in the setup of `test_claim_refreshes_updated_at`: the `clean_tables` fixture's DB connection hit asyncpg's 60 s connect timeout. All 25 Day 5 files on the user's machine were checksum-identical to the sandbox-tested versions, so this is not a code difference.
+- **Diagnosis:** `.env` had `POSTGRES_HOST=localhost`, but docker-compose publishes PostgreSQL on IPv4 `127.0.0.1` only.
+  - On Windows, `localhost` resolves to IPv6 `::1` first, and each refused `::1` attempt costs ~2 s before the `127.0.0.1` fallback.
+  - The suite opens ~900 short-lived connections: ~900 × 2 s ≈ 30 min, which matches the run time.
+  - The single 60 s timeout is most likely a transient stall of Docker Desktop's port forwarding during that connection churn. It's not reproducible in the sandbox and should be re-checked after the host fix.
+- **Security finding:** pytest's default *long* traceback printed the arguments of `asyncpg.connect`, **including the PostgreSQL password**. Reproduced with a canary password: long traceback = leaked; `--tb=short`/`native`/`line` = not leaked.
+- **Fixes:**
+  - `backend/pyproject.toml`: `addopts = "-ra --tb=short"`, verified to print neither the DB password nor the JWT secret;
+  - default `postgres_host` and `.env.example` changed to `127.0.0.1`;
+  - user actions: set `POSTGRES_HOST=127.0.0.1` in `.env` and rotate the exposed DB password (`ALTER ROLE`, then update `.env`).
+- Sandbox re-run after the fixes: 213 passed / 246 skipped (no DB); **459 passed** (with DB); `alembic check` clean.
+
+### 8. Remaining tasks
+- Local verification of Day 5, run 2 (after the host fix and password rotation), then review and commit.
+- Day 6: structured extraction (title, authors, abstract, sections via GROBID; methodology, datasets and results) into `papers` metadata and `paper_sections`, with page-anchored evidence.
+- Day 7: migration 0003 (embeddings) + hybrid retrieval (pgvector + `rank_bm25`) over page-anchored chunks.
+- Day 10: Celery runs extraction automatically after upload; schedule `retry_pending_deletions()` and orphan reconciliation.
+
+### 9. Exact next development milestone
+On Windows, from `backend/`:
+- `pip install -r requirements-dev.txt`;
+- `alembic upgrade head` (expect `0002`);
+- `python -m compileall app`;
+- `python -m pytest` (expect 213 passed, 246 skipped; one more skip if symlinks are unavailable);
+- `$env:RUN_DB_TESTS="1"; python -m pytest` (expect 459 passed);
+- `alembic check`;
+- the README Swagger "Extract text" steps with a real paper.
+
+Then review and commit. Then Day 6.
+
+---
+
 ## Session: Day 4: Secure PDF upload and file storage (2026-11-01)
 
-**Status: implemented and verified in Claude's Linux sandbox (PostgreSQL 16.15).
-PENDING: local verification on Windows + Docker Compose. Day 4 is not complete until that passes. Not committed.**
+**Status: verified locally by the user on Windows (369 tests passed) and committed (`cd7d634`).**
 
 ### 1. Completed tasks
 - `POST /api/v1/workspaces/{workspace_id}/papers` (multipart field `file`): returns 201 `PaperRead` and a `Location` header.

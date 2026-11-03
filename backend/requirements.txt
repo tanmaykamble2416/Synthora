@@ -12,3 +12,5 @@ argon2-cffi==25.1.0
 PyJWT==2.15.1
 email-validator==2.3.0
 python-multipart==0.0.32
+# Day 5 (2026-11-02). PDF text extraction. License: AGPL-3.0 or Artifex commercial (see README).
+PyMuPDF==1.28.2

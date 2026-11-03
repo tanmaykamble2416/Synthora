@@ -36,7 +36,10 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
 
     # --- PostgreSQL ---
-    postgres_host: str = "localhost"
+    # 127.0.0.1, not "localhost": docker-compose publishes PostgreSQL on IPv4 127.0.0.1 only.
+    # On Windows "localhost" resolves to IPv6 ::1 first, and each refused ::1 attempt costs ~2 s
+    # before falling back to 127.0.0.1.
+    postgres_host: str = "127.0.0.1"
     postgres_port: int = Field(default=5433, ge=1, le=65535)
     postgres_user: str = Field(min_length=1)
     postgres_password: SecretStr
@@ -65,6 +68,13 @@ class Settings(BaseSettings):
     paper_storage_dir: Path = Path("storage")
     # Mebibytes (1 MB = 1024 * 1024 bytes).
     max_upload_size_mb: int = Field(default=25, ge=1, le=512)
+
+    # --- PDF text extraction (Day 5) ---
+    # Documents with more pages are rejected (failure_code = too_many_pages).
+    extraction_max_pages: int = Field(default=2000, ge=1, le=20_000)
+    # A paper left in "processing" for longer than this (e.g. after a crash) may be
+    # claimed again by a new extraction request.
+    extraction_stale_minutes: int = Field(default=15, ge=1, le=1440)
 
     @field_validator("jwt_secret_key")
     @classmethod

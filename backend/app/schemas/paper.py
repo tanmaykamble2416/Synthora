@@ -78,9 +78,10 @@ class PaperRead(OutputSchema):
     Deliberately omitted internal fields (they stay in the database for server-side use):
       * storage_key: the server's file location.
       * error_message: raw processing errors can contain file paths, hostnames or
-        stack-trace fragments. Clients see status == "failed"; operators use the
-        DB column and server logs. A user-safe failure reason, if needed, must be
-        a separate field drawn from a fixed set of codes.
+        stack-trace fragments. Clients see status == "failed" plus failure_code;
+        operators use the DB column and server logs.
+
+    failure_code (Day 5) is the user-safe reason: a fixed code, never free text.
     """
 
     id: uuid.UUID
@@ -90,6 +91,7 @@ class PaperRead(OutputSchema):
     file_size_bytes: int
     page_count: int | None
     status: str
+    failure_code: str | None
     title: str | None
     abstract: str | None
     authors: list[AuthorRead] | None

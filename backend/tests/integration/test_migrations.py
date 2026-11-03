@@ -10,7 +10,8 @@ from sqlalchemy.pool import NullPool
 
 from alembic import command
 
-APP_TABLES = {"users", "workspaces", "papers", "paper_sections", "paper_chunks"}
+APP_TABLES = {"users", "workspaces", "papers", "paper_sections", "paper_chunks", "paper_pages"}
+HEAD_REVISION = "0002"
 
 
 def _query(url: URL, sql: str) -> list[tuple]:
@@ -39,7 +40,7 @@ def test_upgrade_downgrade_upgrade_round_trip(alembic_config: Config, test_db_ur
 
     command.upgrade(alembic_config, "head")
     assert APP_TABLES <= _tables(test_db_url)
-    assert _query(test_db_url, "SELECT version_num FROM alembic_version") == [("0001",)]
+    assert _query(test_db_url, "SELECT version_num FROM alembic_version") == [(HEAD_REVISION,)]
 
 
 def test_models_match_migrations(alembic_config: Config) -> None:
@@ -73,3 +74,28 @@ def test_no_vector_columns_yet(test_db_url: URL) -> None:
         "WHERE table_schema = 'public' AND udt_name = 'vector'",
     )
     assert rows == []
+
+
+def test_step_downgrade_to_0001_and_back(alembic_config: Config, test_db_url: URL) -> None:
+    """0002 is reversible on its own: it removes only paper_pages and papers.failure_code."""
+    command.downgrade(alembic_config, "0001")
+    tables = _tables(test_db_url)
+    assert "paper_pages" not in tables and {"users", "workspaces", "papers"} <= tables
+    columns = _query(
+        test_db_url,
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'papers' AND column_name = 'failure_code'",
+    )
+    assert columns == []
+    command.upgrade(alembic_config, "head")
+    assert _query(test_db_url, "SELECT version_num FROM alembic_version") == [(HEAD_REVISION,)]
+
+
+def test_failure_code_constraints_exist(test_db_url: URL) -> None:
+    names = {
+        r[0]
+        for r in _query(
+            test_db_url,
+            "SELECT conname FROM pg_constraint WHERE conrelid = 'papers'::regclass AND contype = 'c'",
+        )
+    }
+    assert {"ck_papers_failure_code_valid", "ck_papers_failure_code_only_when_failed"} <= names

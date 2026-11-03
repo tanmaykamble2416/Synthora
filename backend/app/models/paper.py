@@ -21,10 +21,22 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 if TYPE_CHECKING:
     from app.models.paper_chunk import PaperChunk
+    from app.models.paper_page import PaperPage
     from app.models.paper_section import PaperSection
     from app.models.workspace import Workspace
 
 PAPER_STATUSES = ("uploaded", "processing", "processed", "failed")
+# User-safe reasons for status == "failed" (Day 5). Raw details stay in error_message
+# (internal) and server logs. "no_extractable_text" is reserved: a fully scanned PDF is
+# currently *processed* with every page flagged needs_ocr (see PaperPage).
+FAILURE_CODES = (
+    "file_missing",
+    "pdf_corrupted",
+    "pdf_encrypted",
+    "too_many_pages",
+    "no_extractable_text",
+    "extraction_error",
+)
 
 
 class Paper(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -41,9 +53,12 @@ class Paper(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     page_count: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="uploaded")
+    # Internal only (never in API responses): short technical summary for operators.
     error_message: Mapped[str | None] = mapped_column(Text)
+    # Public, fixed vocabulary: why status == "failed" (Day 5).
+    failure_code: Mapped[str | None] = mapped_column(String(40))
 
-    # Metadata filled by GROBID on Day 5. Nullable: never invented.
+    # Bibliographic metadata (Day 6 extraction or user edits). Nullable: never invented.
     title: Mapped[str | None] = mapped_column(Text)
     abstract: Mapped[str | None] = mapped_column(Text)
     # none_as_null: Python None is stored as SQL NULL, not the JSON value 'null',
@@ -60,6 +75,9 @@ class Paper(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     chunks: Mapped[list["PaperChunk"]] = relationship(
         back_populates="paper", passive_deletes=True, lazy="raise", order_by="PaperChunk.chunk_index"
     )
+    pages: Mapped[list["PaperPage"]] = relationship(
+        back_populates="paper", passive_deletes=True, lazy="raise", order_by="PaperPage.page_number"
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -72,6 +90,12 @@ class Paper(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "publication_year IS NULL OR publication_year BETWEEN 1800 AND 2100",
             name="publication_year_range",
         ),
+        CheckConstraint(
+            "failure_code IS NULL OR failure_code IN ({})".format(", ".join(f"'{c}'" for c in FAILURE_CODES)),
+            name="failure_code_valid",
+        ),
+        # A failure reason can only exist on a failed paper.
+        CheckConstraint("failure_code IS NULL OR status = 'failed'", name="failure_code_only_when_failed"),
         # The same file cannot be uploaded twice into one workspace.
         UniqueConstraint("workspace_id", "sha256"),
         # Target of the composite FK from paper_chunks (paper_id, workspace_id).

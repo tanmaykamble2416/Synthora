@@ -5,7 +5,9 @@ requires-python = ">=3.12,<3.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# --tb=short: the default long traceback prints function arguments, which for a failed
+# database connection includes the PostgreSQL password. Never add -l/--showlocals here.
+addopts = "-ra --tb=short"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
