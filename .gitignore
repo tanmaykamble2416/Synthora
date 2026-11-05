@@ -65,3 +65,6 @@ out/
 # Never commit research PDFs or in-progress upload files (Day 4)
 *.pdf
 *.part
+
+# Local database backups
+*.dump

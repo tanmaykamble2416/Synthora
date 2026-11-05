@@ -40,6 +40,11 @@ class ExtensionMissingError(AppError):
     code = "DATABASE_EXTENSION_MISSING"
 
 
+class GrobidUnavailableError(AppError):
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    code = "GROBID_UNAVAILABLE"
+
+
 class AuthenticationError(AppError):
     """Missing/invalid/expired token or bad login. Message is intentionally generic."""
 

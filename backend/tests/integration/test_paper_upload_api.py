@@ -609,8 +609,8 @@ def test_delete_removes_row_file_and_cascades(
     file_path = stored_files(storage_root)[0]
     query("INSERT INTO paper_sections (paper_id, order_index, text, page_start, page_end) "
           "VALUES (:pid, 0, 'Introduction', 1, 1)", pid=paper_id)
-    query("INSERT INTO paper_chunks (paper_id, workspace_id, chunk_index, text, token_count, page_start, page_end) "
-          "VALUES (:pid, :ws, 0, 'chunk', 1, 1, 1)", pid=paper_id, ws=ws)
+    query("INSERT INTO paper_chunks (paper_id, workspace_id, chunk_index, text, token_count, token_count_method, "
+          "page_start, page_end) VALUES (:pid, :ws, 0, 'chunk', 1, 'unknown', 1, 1)", pid=paper_id, ws=ws)
 
     response = api_client.delete(f"/api/v1/papers/{paper_id}", headers=alice)
 

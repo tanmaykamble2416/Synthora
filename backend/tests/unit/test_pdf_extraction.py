@@ -239,3 +239,52 @@ def test_extraction_is_serialised_by_a_process_wide_lock() -> None:
     # PyMuPDF is not thread-safe; extract_pdf must hold this lock while using MuPDF.
     assert pdf_extraction._MUPDF_LOCK.acquire(blocking=False)
     pdf_extraction._MUPDF_LOCK.release()
+
+
+# --- Day 6 quality pass: PyMuPDF table regions ---------------------------------------------
+
+from app.services.pdf_extraction import detect_table_regions  # noqa: E402
+
+
+def _ruled_table_pdf(path, *, rotate: int = 0):
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 80), "Text above the table.", fontsize=9)
+    for r in range(3):
+        for c, (x0, x1) in enumerate(((72, 250), (250, 430))):
+            page.draw_rect(pymupdf.Rect(x0, 300 + r * 20, x1, 320 + r * 20), color=(0, 0, 0), width=0.7)
+            page.insert_text((x0 + 4, 314 + r * 20), f"cell {r}{c}", fontsize=9)
+    doc.new_page().insert_text((72, 80), "A page without tables.")
+    if rotate:
+        doc[0].set_rotation(rotate)
+    doc.save(path)
+    doc.close()
+
+
+def test_ruled_table_region_is_detected(tmp_path):
+    path = tmp_path / "table.pdf"
+    _ruled_table_pdf(path)
+    regions = detect_table_regions(path, page_count=2)
+    assert len(regions) == 2 and regions[1] == []
+    (x0, y0, x1, y1), = regions[0]
+    assert (round(x0), round(y0), round(x1), round(y1)) == (72, 300, 430, 360)
+
+
+def test_rotated_pages_are_skipped(tmp_path):
+    path = tmp_path / "rotated.pdf"
+    _ruled_table_pdf(path, rotate=90)
+    assert detect_table_regions(path, page_count=2) == [[], []]
+
+
+def test_table_detection_never_raises(tmp_path):
+    path = tmp_path / "broken.pdf"
+    path.write_bytes(b"%PDF-1.7 not really a pdf")
+    assert detect_table_regions(path, page_count=3) == [[], [], []]
+    assert detect_table_regions(tmp_path / "missing.pdf", page_count=1) == [[]]
+
+
+def test_table_detection_prints_nothing(tmp_path, capsys):
+    path = tmp_path / "table.pdf"
+    _ruled_table_pdf(path)
+    detect_table_regions(path, page_count=2)
+    assert "pymupdf_layout" not in capsys.readouterr().out

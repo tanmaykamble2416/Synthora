@@ -14,3 +14,10 @@ email-validator==2.3.0
 python-multipart==0.0.32
 # Day 5 (2026-11-02). PDF text extraction. License: AGPL-3.0 or Artifex commercial (see README).
 PyMuPDF==1.28.2
+# Day 6 (2026-11-03). HTTP client for the optional GROBID service, imported ONLY in
+# app/services/grobid_client.py (replaceable). httpx2 is maintained by Pydantic Services Inc.
+# (BSD-3-Clause). PyPI shows no PEP 740 provenance attestation for it; the 2.16.0 wheel's
+# sha256 was checked against the value PyPI publishes. Its dependencies are pinned too.
+httpx2==2.16.0
+httpcore2==2.16.0
+truststore==0.10.5

@@ -1,4 +1,5 @@
-"""Day 5: POST /papers/{id}/extract, GET /papers/{id}/pages[/{n}].
+"""Day 5: POST /papers/{id}/extract, GET /papers/{id}/pages[/{n}] (GROBID disabled here; see
+test_paper_structure_api.py for Day 6 structure, GROBID and keep-last-good tests).
 
 Papers are uploaded through the real Day 4 endpoint into the per-test tmp storage
 root, then extracted. Only the guarded test database is used.
@@ -264,35 +265,58 @@ def test_reextraction_replaces_pages_without_duplicates(
     assert second["processed_at"] >= first["processed_at"]
 
 
-def test_failed_reextraction_removes_previous_pages(
+def test_failed_reextraction_keeps_previous_extraction(
     api_client: TestClient, alice: dict, query: Callable, storage_root: Path
 ) -> None:
+    """Day 6 (approved behaviour change): a failed re-run no longer deletes the last good
+    extraction. The failure is recorded as the latest attempt only."""
     paper_id = upload(api_client, alice, MIXED_PDF)
-    assert extract(api_client, alice, paper_id).json()["status"] == "processed"
+    first = extract(api_client, alice, paper_id).json()
+    assert first["status"] == "processed"
+    before_pages = query("SELECT id, page_number, text FROM paper_pages WHERE paper_id = :pid ORDER BY 2", pid=paper_id)
+    before_chunks = query("SELECT id, text FROM paper_chunks WHERE paper_id = :pid ORDER BY 1", pid=paper_id)
+    assert before_chunks  # Day 6 fallback chunks exist
     (storage_root / paper_row(query, paper_id).storage_key).unlink()
 
     summary = extract(api_client, alice, paper_id).json()
 
     assert (summary["status"], summary["failure_code"]) == ("failed", "file_missing")
-    assert page_rows(query, paper_id) == []  # old pages cannot be mistaken for a new success
-    assert pages(api_client, alice, paper_id).json()["total"] == 0
-    assert paper_row(query, paper_id).page_count is None
+    assert summary["retained_previous_extraction"] is True
+    assert summary["paper_status"] == "processed"
+    assert summary["processed_at"] == first["processed_at"]  # time of the last SUCCESS
+    assert query("SELECT id, page_number, text FROM paper_pages WHERE paper_id = :pid ORDER BY 2", pid=paper_id) == before_pages
+    assert query("SELECT id, text FROM paper_chunks WHERE paper_id = :pid ORDER BY 1", pid=paper_id) == before_chunks
+    assert pages(api_client, alice, paper_id).json()["total"] == 4
+    row = query(
+        "SELECT status, failure_code, page_count, last_extraction_failure_code, "
+        "last_extraction_attempt_at > processed_at AS later FROM papers WHERE id = :pid", pid=paper_id,
+    )[0]
+    assert (row.status, row.failure_code, row.page_count) == ("processed", None, 4)
+    assert row.last_extraction_failure_code == "file_missing" and row.later is True
+    detail = api_client.get(f"/api/v1/papers/{paper_id}", headers=alice).json()
+    assert (detail["status"], detail["failure_code"], detail["last_extraction_failure_code"]) == (
+        "processed", None, "file_missing",
+    )
 
 
-def test_reextraction_clears_derived_sections_and_chunks(
+def test_reextraction_replaces_stale_derived_rows(
     api_client: TestClient, alice: dict, query: Callable
 ) -> None:
     paper_id = upload(api_client, alice, MIXED_PDF)
     extract(api_client, alice, paper_id)
     ws = query("SELECT workspace_id FROM papers WHERE id = :pid", pid=paper_id)[0].workspace_id
-    query("INSERT INTO paper_sections (paper_id, order_index, text, page_start, page_end) VALUES (:p, 0, 'x', 1, 1)", p=paper_id)
-    query("INSERT INTO paper_chunks (paper_id, workspace_id, chunk_index, text, token_count, page_start, page_end) "
-          "VALUES (:p, :w, 0, 'x', 1, 1, 1)", p=paper_id, w=ws)
+    query("INSERT INTO paper_sections (paper_id, order_index, text, page_start, page_end) "
+          "VALUES (:p, 99, 'STALE SECTION', 1, 1)", p=paper_id)
+    query("INSERT INTO paper_chunks (paper_id, workspace_id, chunk_index, text, token_count, token_count_method, "
+          "page_start, page_end) VALUES (:p, :w, 999, 'STALE CHUNK', 1, 'unknown', 1, 1)", p=paper_id, w=ws)
+    query("INSERT INTO paper_references (paper_id, ref_index, raw_text) VALUES (:p, 0, 'STALE REFERENCE')", p=paper_id)
 
     extract(api_client, alice, paper_id)
 
     assert query("SELECT count(*) AS n FROM paper_sections WHERE paper_id = :p", p=paper_id)[0].n == 0
-    assert query("SELECT count(*) AS n FROM paper_chunks WHERE paper_id = :p", p=paper_id)[0].n == 0
+    assert query("SELECT count(*) AS n FROM paper_references WHERE paper_id = :p", p=paper_id)[0].n == 0
+    chunks = query("SELECT text, token_count_method FROM paper_chunks WHERE paper_id = :p", p=paper_id)
+    assert chunks and all(c.text != "STALE CHUNK" and c.token_count_method == "word_proxy" for c in chunks)
 
 
 def test_other_papers_pages_are_untouched(api_client: TestClient, alice: dict, query: Callable) -> None:
@@ -364,7 +388,8 @@ def test_result_is_discarded_if_superseded(
 
     def finish_elsewhere_first(path: Path, **kwargs: Any):
         result = real_engine(path, **kwargs)
-        query("UPDATE papers SET status = 'processed' WHERE id = :pid", pid=paper_id)
+        # What another worker's successful T2 leaves behind: processed, claim released.
+        query("UPDATE papers SET status = 'processed', extraction_claim_id = NULL WHERE id = :pid", pid=paper_id)
         return result
 
     monkeypatch.setattr(extraction_service, "extract_pdf", finish_elsewhere_first)
@@ -372,6 +397,32 @@ def test_result_is_discarded_if_superseded(
 
     assert response.status_code == 409
     assert page_rows(query, paper_id) == []
+
+
+def test_result_is_discarded_if_reclaimed_while_running(
+    api_client: TestClient, alice: dict, query: Callable, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale-recovery claim by another worker (status still 'processing', new claim id)
+    fences this attempt out: it writes nothing and leaves the paper to the new claim."""
+    paper_id = upload(api_client, alice, MIXED_PDF)
+    real_engine = extraction_service.extract_pdf
+    takeover = uuid.uuid4()
+
+    def reclaimed_meanwhile(path: Path, **kwargs: Any):
+        result = real_engine(path, **kwargs)
+        query("UPDATE papers SET extraction_claim_id = :c, updated_at = now() WHERE id = :pid",
+              c=takeover, pid=paper_id)
+        return result
+
+    monkeypatch.setattr(extraction_service, "extract_pdf", reclaimed_meanwhile)
+    response = extract(api_client, alice, paper_id)
+
+    assert response.status_code == 409
+    assert page_rows(query, paper_id) == []
+    row = query("SELECT status, extraction_claim_id, failure_code, last_extraction_failure_code, "
+                "last_extraction_attempt_at FROM papers WHERE id = :pid", pid=paper_id)[0]
+    assert (row.status, row.extraction_claim_id) == ("processing", takeover)  # untouched
+    assert (row.failure_code, row.last_extraction_failure_code, row.last_extraction_attempt_at) == (None, None, None)
 
 
 # === Transaction rollback and unexpected errors ===============================================
@@ -499,6 +550,7 @@ async def test_repositories_never_touch_another_owners_paper(db_session: Any) ->
     from app.models import Paper, User, Workspace
     from app.repositories.paper_page_repository import PaperPageRepository
     from app.services.pdf_extraction import PageExtraction
+    from app.repositories.paper_structure_repository import PaperStructureRepository
 
     owner = User(email="owner@example.com", hashed_password="x")
     intruder = User(email="intruder@example.com", hashed_password="x")
@@ -515,18 +567,54 @@ async def test_repositories_never_touch_another_owners_paper(db_session: Any) ->
     await PaperPageRepository(db_session).insert_pages(
         paper_id, [PageExtraction(1, "secret text", 11, 2, "low_text", False, 0)]
     )
+    # Day 6 rows too, so the structure reads below have something they must NOT return.
+    from app.services.chunker import ChunkDraft, SectionDraft
+    from app.services.tei_parser import TeiReference
+
+    structure_repo = PaperStructureRepository(db_session)
+    ids = await structure_repo.insert_sections(paper_id, [SectionDraft(0, 1, "H", "other", "secret", 1, 1)])
+    await structure_repo.insert_chunks(
+        paper_id, workspace.id, [ChunkDraft(0, 0, "secret chunk", 2, "word_proxy", 1, 1)], ids
+    )
+    await structure_repo.insert_references(paper_id, [TeiReference("secret ref", None, (), None, None, None, None, None)])
     await db_session.commit()
 
     papers, page_repo = PaperRepository(db_session), PaperPageRepository(db_session)
     assert await page_repo.list_owned(paper_id, intruder_id, limit=10, offset=0) == ([], 0)
     assert await page_repo.get_owned(paper_id, intruder_id, 1) is None
     assert await papers.claim_for_extraction(paper_id, intruder_id, stale_after=timedelta(minutes=15)) is None
-    assert await papers.lock_status_for_update(paper_id, intruder_id) is None
+    assert await papers.lock_for_persist(paper_id, intruder_id) is None
     await papers.delete_extracted_content(paper_id, intruder_id)
+    await papers.fill_metadata(paper_id, intruder_id, {"title": "hijacked"})
     await db_session.commit()
+    # Even with the paper in 'processing' and the CORRECT claim id, the intruder cannot
+    # finish or fail it: only the owner filter stops these statements.
+    claim = uuid.uuid4()
+    await db_session.execute(
+        text("UPDATE papers SET status = 'processing', extraction_claim_id = :c WHERE id = :p"),
+        {"p": paper_id, "c": claim},
+    )
+    await db_session.commit()
+    assert await papers.mark_processed(
+        paper_id, intruder_id, claim_id=claim, page_count=1, structure_source="page_fallback",
+        grobid_outcome="disabled",
+    ) is None
+    assert await papers.record_failed_attempt(
+        paper_id, intruder_id, claim_id=claim, failure_code="extraction_error", internal_message="x"
+    ) is None
+    await db_session.commit()
+    structure = PaperStructureRepository(db_session)
+    for method in (structure.list_sections_owned, structure.list_chunks_owned, structure.list_references_owned):
+        assert await method(paper_id, intruder_id, limit=10, offset=0) == ([], 0)
+    status, title = (await db_session.execute(
+        text("SELECT status, title FROM papers WHERE id = :p"), {"p": paper_id}
+    )).one()
+    assert (status, title) == ("processing", None)
 
     items, total = await page_repo.list_owned(paper_id, owner_id, limit=10, offset=0)
     assert total == 1 and items[0].text == "secret text"  # untouched by the intruder
+    for method in (structure.list_sections_owned, structure.list_chunks_owned, structure.list_references_owned):
+        assert (await method(paper_id, owner_id, limit=10, offset=0))[1] == 1  # the owner still sees them
 
 
 # === Deletion =================================================================================

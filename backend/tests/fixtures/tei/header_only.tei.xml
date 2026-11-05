@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<TEI xmlns="http://www.tei-c.org/ns/1.0">
+	<teiHeader xml:lang="en"><fileDesc><titleStmt><title level="a" type="main">Only A Header</title></titleStmt>
+	<publicationStmt><publisher/></publicationStmt><sourceDesc><biblStruct><analytic/><monogr><imprint><date/></imprint></monogr></biblStruct></sourceDesc></fileDesc>
+	<profileDesc><abstract><div xmlns="http://www.tei-c.org/ns/1.0"><p>An abstract alone is not a usable body.</p></div></abstract></profileDesc></teiHeader>
+	<text xml:lang="en"><body/><back/></text>
+</TEI>

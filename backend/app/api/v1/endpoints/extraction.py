@@ -1,11 +1,11 @@
-"""Day 5: PDF text extraction and access to page-level text. All routes are owner-only."""
+"""Day 5/6: PDF extraction (pages + structure) and access to page-level text. All routes are owner-only."""
 
 import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Path, Query
 
-from app.api.deps import CurrentUser, DbSession, SettingsDep, StorageDep
+from app.api.deps import CurrentUser, DbSession, GrobidDep, SettingsDep, StorageDep
 from app.schemas.common import Page
 from app.schemas.error import ErrorResponse
 from app.schemas.extraction import ExtractionSummary, PaperPageRead
@@ -24,27 +24,39 @@ router = APIRouter(
 @router.post(
     "/extract",
     response_model=ExtractionSummary,
-    summary="Extract the text of every page of one of my papers",
+    summary="Extract pages, sections, chunks, references and metadata of one of my papers",
     description=(
-        "Runs synchronously. Re-running replaces all previously extracted pages. "
-        "Handled outcomes return **200**: `status` is `processed`, or `failed` with a "
-        "`failure_code` (`file_missing`, `pdf_corrupted`, `pdf_encrypted`, `too_many_pages`, "
-        "`extraction_error`). A fully scanned PDF is `processed` with every page flagged "
-        "`needs_ocr`; no OCR is performed."
+        "Runs synchronously. Page text comes from PyMuPDF; sections, references and "
+        "bibliographic metadata come from GROBID when it is enabled and reachable. "
+        "Otherwise the paper is still processed with page-based chunks "
+        "(`structure_source` = `page_fallback`, reason in `grobid_outcome`).\n\n"
+        "A successful re-run atomically replaces the previous pages, sections, chunks and "
+        "references. A **failed** re-run keeps the previous extraction: `status` = `failed`, "
+        "`retained_previous_extraction` = true, `paper_status` = `processed`.\n\n"
+        "Metadata is only filled where the paper's field is empty; values you edited are never "
+        "overwritten. Chunk sizes are counted in words (`token_count_method` = `word_proxy`).\n\n"
+        "Handled outcomes return **200**; `failure_code` is one of `file_missing`, `pdf_corrupted`, "
+        "`pdf_encrypted`, `too_many_pages`, `extraction_error`. A fully scanned PDF is `processed` "
+        "with every page flagged `needs_ocr`; no OCR is performed."
     ),
     responses={409: {"model": ErrorResponse, "description": "An extraction of this paper is already running"}},
 )
 async def extract_paper(
-    paper_id: uuid.UUID, user: CurrentUser, session: DbSession, storage: StorageDep, settings: SettingsDep
+    paper_id: uuid.UUID,
+    user: CurrentUser,
+    session: DbSession,
+    storage: StorageDep,
+    settings: SettingsDep,
+    grobid: GrobidDep,
 ) -> ExtractionSummary:
-    return await ExtractionService(session, storage, settings).extract(user.id, paper_id)
+    return await ExtractionService(session, storage, settings, grobid).extract(user.id, paper_id)
 
 
 @router.get(
     "/pages",
     response_model=Page[PaperPageRead],
     summary="List the extracted pages of one of my papers, in page order",
-    description="Empty until an extraction has completed (status `processed`).",
+    description="Empty until an extraction has completed. Kept unchanged while a re-extraction runs.",
 )
 async def list_paper_pages(
     paper_id: uuid.UUID,

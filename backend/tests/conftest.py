@@ -34,6 +34,8 @@ UNIT_ENV = {
     "POSTGRES_DB": "test_db",
     "DB_CONNECT_TIMEOUT": "2",
     "JWT_SECRET_KEY": TEST_JWT_SECRET,
+    # Never call a real GROBID from unit tests, whatever the developer's .env says.
+    "GROBID_ENABLED": "false",
 }
 
 

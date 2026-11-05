@@ -1,5 +1,7 @@
-# RESEARCHMIND — local infrastructure (Day 1: PostgreSQL 16 + pgvector only).
-# Redis, GROBID, the backend and the frontend are added on the days they are needed.
+# RESEARCHMIND — local infrastructure.
+#   Day 1: PostgreSQL 16 + pgvector.
+#   Day 6: GROBID (optional document-structure service).
+# Redis, the backend and the frontend are added on the days they are needed.
 name: researchmind
 
 services:
@@ -29,6 +31,35 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  grobid:
+    # Day 6. OPTIONAL: when it is stopped or unhealthy, extraction still succeeds with
+    # page-based chunks (structure_source = page_fallback). Enable it in .env with
+    # GROBID_ENABLED=true. CRF-only CPU image (~500 MB); the full "-full" image is ~8 GB.
+    # After the first pull, pin the digest for reproducibility (see README).
+    image: grobid/grobid:0.9.1-crf
+    container_name: researchmind-grobid
+    restart: unless-stopped
+    # Recommended by GROBID: an init process reaps the PDF-parsing child processes, and
+    # core dumps are disabled so a crashing PDF cannot fill the disk.
+    init: true
+    ulimits:
+      core: 0
+    ports:
+      # Bound to 127.0.0.1: GROBID has no authentication and must not be reachable from the LAN.
+      - "127.0.0.1:${GROBID_PORT:-8070}:8070"
+    # No volume: GROBID keeps no data. Full-text processing needs about 4 GB of RAM.
+    healthcheck:
+      # The image ships neither curl nor wget; bash's /dev/tcp is enough to call /api/isalive.
+      test:
+        - "CMD"
+        - "bash"
+        - "-c"
+        - "exec 3<>/dev/tcp/127.0.0.1/8070 && printf 'GET /api/isalive HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q true <&3"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
 
 volumes:
   postgres_data:

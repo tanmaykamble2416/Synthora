@@ -3,6 +3,7 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -75,6 +76,54 @@ class Settings(BaseSettings):
     # A paper left in "processing" for longer than this (e.g. after a crash) may be
     # claimed again by a new extraction request.
     extraction_stale_minutes: int = Field(default=15, ge=1, le=1440)
+    # Day 6 quality pass: find table regions with PyMuPDF so that GROBID paragraphs made of
+    # table cells become separate table chunks. Runs only when GROBID's TEI is used (~0.1 s/page).
+    extraction_detect_tables: bool = True
+
+    # --- GROBID document structure (Day 6) ---
+    # Optional. When disabled or unreachable, extraction still succeeds with the
+    # PyMuPDF page-based fallback (structure_source = page_fallback).
+    grobid_enabled: bool = False
+    # Base URL only (scheme://host:port), no credentials, path, query or fragment.
+    grobid_url: str = "http://127.0.0.1:8070"
+    # Upper bound for one full-text request (large papers take tens of seconds on CPU).
+    grobid_timeout_seconds: int = Field(default=120, ge=5, le=600)
+
+    # --- Chunking (Day 6) ---
+    # Sizes are in WORDS (whitespace-separated), a temporary proxy for tokens until
+    # Day 7 introduces the embedding model's real tokenizer.
+    chunk_target_words: int = Field(default=350, ge=50, le=2000)
+    chunk_max_words: int = Field(default=500, ge=50, le=4000)
+    chunk_min_words: int = Field(default=60, ge=1, le=1000)
+    # What the three sizes above count (Day 6 quality pass). "word_proxy" (default) counts
+    # words. "tokenizer" uses CHUNK_TOKENIZER_FILE (a local tokenizer.json, never downloaded)
+    # and falls back to word_proxy if it or the optional `tokenizers` package is missing.
+    chunk_token_counter: Literal["word_proxy", "tokenizer"] = "word_proxy"
+    chunk_tokenizer_file: Path | None = None
+    # Label stored as token_count_method = "tokenizer:<name>".
+    chunk_tokenizer_name: str = Field(default="BAAI/bge-small-en-v1.5", pattern=r"^[A-Za-z0-9._@/\-]{1,50}$")
+
+    @field_validator("grobid_url")
+    @classmethod
+    def _validate_grobid_url(cls, value: str) -> str:
+        parts = urlsplit(value.strip())
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("GROBID_URL must be an http(s) URL such as http://127.0.0.1:8070.")
+        if parts.username or parts.password:
+            raise ValueError("GROBID_URL must not contain credentials.")
+        if parts.path not in ("", "/") or parts.query or parts.fragment:
+            raise ValueError("GROBID_URL must be a base URL without path, query or fragment.")
+        try:
+            parts.port  # noqa: B018 - raises ValueError for an out-of-range port
+        except ValueError as exc:
+            raise ValueError("GROBID_URL has an invalid port.") from exc
+        return f"{parts.scheme}://{parts.netloc}"
+
+    @model_validator(mode="after")
+    def _check_chunk_sizes(self) -> "Settings":
+        if not (self.chunk_min_words < self.chunk_target_words <= self.chunk_max_words):
+            raise ValueError("Chunk sizes must satisfy CHUNK_MIN_WORDS < CHUNK_TARGET_WORDS <= CHUNK_MAX_WORDS.")
+        return self
 
     @field_validator("jwt_secret_key")
     @classmethod

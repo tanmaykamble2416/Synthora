@@ -16,3 +16,11 @@ class DatabaseHealthResponse(BaseModel):
     server_version: str
     pgvector_version: str
     latency_ms: float
+
+
+class GrobidHealthResponse(BaseModel):
+    """status "disabled": GROBID_ENABLED=false (extraction uses the page fallback).
+    The GROBID URL is deliberately not included."""
+
+    status: Literal["ok", "disabled"]
+    latency_ms: float | None

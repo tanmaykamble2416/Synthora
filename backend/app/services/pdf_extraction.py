@@ -41,6 +41,9 @@ _MUPDF_LOCK = threading.Lock()
 # TOOLS.mupdf_warnings() instead and logged in a controlled, size-limited form.
 pymupdf.TOOLS.mupdf_display_errors(False)
 pymupdf.TOOLS.mupdf_display_warnings(False)
+# PyMuPDF otherwise prints a one-time advertisement for its optional layout package
+# to stdout the first time table detection runs.
+pymupdf.no_recommend_layout()
 
 
 class ExtractionFailure(Exception):
@@ -164,3 +167,29 @@ def _summarise(warnings: str, limit: int = 200) -> str:
     """One line, bounded length. MuPDF messages describe PDF objects, not file paths."""
     flat = " | ".join(line.strip() for line in warnings.splitlines() if line.strip())
     return flat[:limit] + ("…" if len(flat) > limit else "")
+
+
+def detect_table_regions(path: Path, *, page_count: int) -> list[list[tuple[float, float, float, float]]]:
+    """Bounding boxes (x0, y0, x1, y1, PDF points, origin top-left) of the tables PyMuPDF's
+    table finder detects, per page. Used only to recognise table text in GROBID's output;
+    it never fails an extraction: any problem gives "no tables" for that page (or all pages).
+
+    Pages that are rotated or whose crop box does not start at (0, 0) are skipped, because
+    their coordinates may not line up with GROBID's. Costs roughly 0.1 s per page."""
+    regions: list[list[tuple[float, float, float, float]]] = [[] for _ in range(page_count)]
+    try:
+        with _MUPDF_LOCK:
+            with pymupdf.open(path, filetype="pdf") as doc:
+                for index in range(min(page_count, doc.page_count)):
+                    try:
+                        page = doc.load_page(index)
+                        if page.rotation != 0 or page.cropbox.x0 != 0 or page.cropbox.y0 != 0:
+                            continue
+                        regions[index] = [tuple(round(v, 2) for v in t.bbox) for t in page.find_tables().tables]
+                    except Exception as exc:  # table detection is best effort
+                        logger.warning("Table detection skipped on page %d: %s", index + 1, type(exc).__name__)
+                pymupdf.TOOLS.mupdf_warnings(reset=True)
+    except Exception as exc:
+        logger.warning("Table detection skipped: %s", type(exc).__name__)
+        return [[] for _ in range(page_count)]
+    return regions

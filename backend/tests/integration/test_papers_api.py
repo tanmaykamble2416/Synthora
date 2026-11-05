@@ -36,6 +36,13 @@ INTERNAL_FIELDS = {
     "original_filename": "evil.pdf",
     "owner_id": str(uuid.uuid4()),
     "created_at": "2020-01-01T00:00:00Z",
+    # Day 6 extraction provenance: set only by the server.
+    "structure_source": "grobid",
+    "grobid_outcome": "used",
+    "last_extraction_failure_code": None,
+    "last_extraction_attempt_at": "2026-01-01T00:00:00Z",
+    "failure_code": "pdf_corrupted",
+    "extraction_claim_id": "00000000-0000-0000-0000-000000000001",
 }
 
 
@@ -264,7 +271,7 @@ def test_internal_error_details_and_paths_never_exposed(
 def test_openapi_paper_schema_omits_internal_fields(api_client: TestClient) -> None:
     schemas = api_client.get("/openapi.json").json()["components"]["schemas"]
     properties = set(schemas["PaperRead"]["properties"])
-    assert {"storage_key", "error_message"}.isdisjoint(properties)
+    assert {"storage_key", "error_message", "extraction_claim_id"}.isdisjoint(properties)
     assert {"id", "status", "title", "authors", "doi"} <= properties
 
 
@@ -485,7 +492,8 @@ def test_empty_patch_rejected(api_client: TestClient, alice: dict, seed_paper: S
 
 def test_unknown_fields_rejected(api_client: TestClient, alice: dict, seed_paper: SeedPaper) -> None:
     paper_id = seed_paper(_workspace(api_client, alice))
-    for payload in ({"keywords": ["nlp"]}, {"title": "ok", "venue": "NeurIPS"}):
+    # (Day 6: "venue" is now an editable field, so "publisher" is the unknown example.)
+    for payload in ({"keywords": ["nlp"]}, {"title": "ok", "publisher": "ACM"}):
         assert api_client.patch(_paper_url(paper_id), json=payload, headers=alice).status_code == 422
 
 
@@ -630,3 +638,12 @@ async def test_repository_never_touches_papers_of_another_owner(db_session: Asyn
     owned = await repo.get_owned(paper_id, owner_id)
     assert owned is not None and owned.title == "Original"
     assert (await repo.list_in_workspace(workspace_id, owner_id, limit=10, offset=0))[1] == 1
+
+
+def test_venue_can_be_edited_and_cleared(api_client: TestClient, alice: dict, seed_paper: SeedPaper) -> None:
+    paper_id = seed_paper(_workspace(api_client, alice))
+    response = api_client.patch(_paper_url(paper_id), json={"venue": "  NeurIPS 2024  "}, headers=alice)
+    assert response.status_code == 200 and response.json()["venue"] == "NeurIPS 2024"
+    assert api_client.patch(_paper_url(paper_id), json={"venue": "v" * 1001}, headers=alice).status_code == 422
+    response = api_client.patch(_paper_url(paper_id), json={"venue": None}, headers=alice)
+    assert response.status_code == 200 and response.json()["venue"] is None

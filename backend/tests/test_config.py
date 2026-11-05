@@ -105,3 +105,85 @@ def test_jwt_secret_hidden_in_repr() -> None:
 def test_database_url_for_other_database() -> None:
     url = _settings(postgres_db="dev").database_url_for("dev_test")
     assert url.database == "dev_test"
+
+
+# --- Day 6: GROBID and chunking configuration -----------------------------------
+
+
+def test_grobid_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GROBID_ENABLED", raising=False)
+    assert _settings().grobid_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "normalized"),
+    [
+        ("http://127.0.0.1:8070", "http://127.0.0.1:8070"),
+        ("http://grobid:8070/", "http://grobid:8070"),
+        ("  https://grobid.internal  ", "https://grobid.internal"),
+    ],
+)
+def test_grobid_url_is_normalized(raw: str, normalized: str) -> None:
+    assert _settings(grobid_url=raw).grobid_url == normalized
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://127.0.0.1:8070",
+        "file:///etc/passwd",
+        "127.0.0.1:8070",
+        "http://user:secret@127.0.0.1:8070",
+        "http://127.0.0.1:8070/api/processFulltextDocument",
+        "http://127.0.0.1:8070?x=1",
+        "http://127.0.0.1:99999",
+        "http://",
+    ],
+)
+def test_unsafe_or_malformed_grobid_url_is_rejected(url: str) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        _settings(grobid_url=url)
+    assert "secret" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("seconds", [0, 4, 601])
+def test_grobid_timeout_is_bounded(seconds: int) -> None:
+    with pytest.raises(ValidationError):
+        _settings(grobid_timeout_seconds=seconds)
+
+
+def test_default_chunk_sizes() -> None:
+    settings = _settings()
+    assert (settings.chunk_min_words, settings.chunk_target_words, settings.chunk_max_words) == (60, 350, 500)
+
+
+@pytest.mark.parametrize(
+    ("minimum", "target", "maximum"),
+    [(350, 350, 500), (60, 600, 500), (400, 350, 500)],
+)
+def test_inconsistent_chunk_sizes_are_rejected(minimum: int, target: int, maximum: int) -> None:
+    with pytest.raises(ValidationError):
+        _settings(chunk_min_words=minimum, chunk_target_words=target, chunk_max_words=maximum)
+
+
+# --- Day 6 quality pass ---------------------------------------------------------------------
+
+
+def test_quality_pass_defaults() -> None:
+    settings = _settings()
+    assert settings.extraction_detect_tables is True
+    assert settings.chunk_token_counter == "word_proxy"
+    assert settings.chunk_tokenizer_file is None
+    assert settings.chunk_tokenizer_name == "BAAI/bge-small-en-v1.5"
+
+
+@pytest.mark.parametrize("value", ["bert", "tokens", ""])
+def test_unknown_token_counter_is_rejected(value: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(chunk_token_counter=value)
+
+
+@pytest.mark.parametrize("name", ["has space", "x" * 51, "semi;colon", ""])
+def test_tokenizer_label_is_restricted(name: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(chunk_tokenizer_name=name)

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<TEI xmlns="http://www.tei-c.org/ns/1.0">
+	<teiHeader xml:lang="en"><fileDesc><titleStmt><title level="a" type="main"></title></titleStmt>
+	<publicationStmt><publisher/></publicationStmt><sourceDesc><biblStruct><analytic/><monogr><imprint><date/></imprint></monogr></biblStruct></sourceDesc></fileDesc>
+	<profileDesc><abstract/></profileDesc></teiHeader>
+	<text xml:lang="en">
+		<body>
+<div xmlns="http://www.tei-c.org/ns/1.0"><p>Untitled opening paragraph without a heading or coordinates.</p></div>
+<div xmlns="http://www.tei-c.org/ns/1.0"><head n="2.">Background</head><p>Second paragraph without coordinates.</p></div>
+		</body>
+		<back><div type="references"><listBibl/></div></back>
+	</text>
+</TEI>

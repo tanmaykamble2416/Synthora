@@ -2,7 +2,8 @@
 
 AI-powered research intelligence and literature review platform. *Intelligence Beyond Papers.*
 
-> Status: **Day 5: PDF text extraction** (pending local verification). Days 1–4 verified.
+> Status: **Day 6: document structure, GROBID and chunking** (pending local verification).
+> Days 1–4 verified; Day 5 committed.
 > Formerly RESEARCHMIND. Only the branding changed: the Docker Compose project, container,
 > database name, database user and volume keep the `researchmind` names on purpose
 > (renaming the Compose project would create a new, empty volume).
@@ -20,9 +21,10 @@ AI-powered research intelligence and literature review platform. *Intelligence B
 Copy-Item .env.example .env
 # Edit .env: set POSTGRES_PASSWORD and JWT_SECRET_KEY (see "Secrets" below)
 
-# 2. Start PostgreSQL 16 + pgvector
-docker compose up -d
+# 2. Start PostgreSQL 16 + pgvector (and, optionally, GROBID)
+docker compose up -d postgres
 docker compose ps                # STATUS must show "healthy"
+docker compose up -d grobid      # optional; first pull ~500 MB, ready after ~1 minute
 
 # 3. Python environment
 cd backend
@@ -55,6 +57,14 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 | `MAX_UPLOAD_SIZE_MB` | `25` | Maximum size of one PDF, in MB (1 MB = 1,048,576 bytes). Allowed range: 1–512. |
 | `EXTRACTION_MAX_PAGES` | `2000` | PDFs with more pages fail with `too_many_pages`. Allowed range: 1–20000. |
 | `EXTRACTION_STALE_MINUTES` | `15` | A paper left in `processing` longer than this (e.g. after a server crash) can be extracted again. |
+| `GROBID_ENABLED` | `false` (`.env.example`: `true`) | Use GROBID for sections, references and metadata. When `false` or unreachable, extraction still succeeds with page-based chunks. |
+| `GROBID_URL` | `http://127.0.0.1:8070` | Base URL only (no credentials, path or query). Use `127.0.0.1`, not `localhost`. |
+| `GROBID_PORT` | `8070` | Host port that docker-compose publishes GROBID on (keep equal to the port in `GROBID_URL`). |
+| `GROBID_TIMEOUT_SECONDS` | `120` | Total time allowed for one full-text request (5–600). |
+| `CHUNK_TARGET_WORDS` / `CHUNK_MAX_WORDS` / `CHUNK_MIN_WORDS` | `350` / `500` / `60` | Chunk sizes, in the unit of `CHUNK_TOKEN_COUNTER` (**words** by default). Must satisfy MIN < TARGET ≤ MAX. |
+| `CHUNK_TOKEN_COUNTER` | `word_proxy` | `word_proxy` or `tokenizer` (uses `CHUNK_TOKENIZER_FILE`; falls back to `word_proxy` when unavailable). |
+| `CHUNK_TOKENIZER_FILE` / `CHUNK_TOKENIZER_NAME` | none / `BAAI/bge-small-en-v1.5` | Local `tokenizer.json` (never downloaded) and the name stored as `tokenizer:<name>`. |
+| `EXTRACTION_DETECT_TABLES` | `true` | Detect ruled tables with PyMuPDF so their text becomes separate table chunks. |
 
 `storage/` is ignored by Git, and so are `*.pdf` and `*.part` files anywhere in the repo.
 
@@ -80,7 +90,14 @@ python -m pytest
 
 # Integration tests: ONLY touch TEST_POSTGRES_DB (default researchmind_test)
 $env:RUN_DB_TESTS="1"; python -m pytest; Remove-Item Env:RUN_DB_TESTS
+
+# Optional: against the real GROBID container (docker compose up -d grobid)
+$env:RUN_DB_TESTS="1"; $env:RUN_GROBID_TESTS="1"; python -m pytest tests/integration/test_grobid_live.py -v -s
+Remove-Item Env:RUN_DB_TESTS, Env:RUN_GROBID_TESTS
 ```
+
+Tests never call a real GROBID unless `RUN_GROBID_TESTS=1`: everywhere else `GROBID_ENABLED` is forced to
+`false` and GROBID is replaced by an in-process fake that serves the TEI files in `backend/tests/fixtures/tei/`.
 
 How the development database and files are kept safe from tests:
 - the test DB name must end in `_test`, differ from `POSTGRES_DB` and be a plain identifier, or the run aborts;
@@ -96,6 +113,7 @@ How the development database and files are kept safe from tests:
 |---|---|---|---|
 | GET | `/api/v1/health` | – | Liveness |
 | GET | `/api/v1/health/db` | – | Readiness (DB + pgvector) |
+| GET | `/api/v1/health/grobid` | – | GROBID: `ok`, `disabled` (200) or 503 when enabled but unreachable |
 | POST | `/api/v1/auth/register` | – | Create account |
 | POST | `/api/v1/auth/login` | – | OAuth2 password form (`username` = email) → bearer token |
 | GET / PATCH / DELETE | `/api/v1/users/me` | Bearer | Own account only |
@@ -104,11 +122,14 @@ How the development database and files are kept safe from tests:
 | **POST** | `/api/v1/workspaces/{id}/papers` | Bearer | **Upload a PDF** (multipart field `file`) → 201 + `Location` header |
 | GET | `/api/v1/workspaces/{id}/papers` | Bearer | List papers in own workspace (`limit` ≤ 100, `offset`; newest first) |
 | GET | `/api/v1/papers/{id}` | Bearer | Own paper only (others' → 404) |
-| PATCH | `/api/v1/papers/{id}` | Bearer | Edit `title`, `abstract`, `authors`, `publication_year`, `doi` only |
-| DELETE | `/api/v1/papers/{id}` | Bearer | Delete the paper record, its pages/sections/chunks and its stored PDF |
-| **POST** | `/api/v1/papers/{id}/extract` | Bearer | **Extract the text of every page** → 200 `ExtractionSummary` (409 if already running) |
+| PATCH | `/api/v1/papers/{id}` | Bearer | Edit `title`, `abstract`, `authors`, `publication_year`, `doi`, `venue` only |
+| DELETE | `/api/v1/papers/{id}` | Bearer | Delete the paper record, its pages/sections/chunks/references and its stored PDF |
+| **POST** | `/api/v1/papers/{id}/extract` | Bearer | **Extract pages, sections, chunks, references and metadata** → 200 `ExtractionSummary` (409 if already running) |
 | GET | `/api/v1/papers/{id}/pages` | Bearer | Extracted pages in page order (`limit` ≤ 50, `offset`) |
 | GET | `/api/v1/papers/{id}/pages/{page_number}` | Bearer | One extracted page (1-based) |
+| GET | `/api/v1/papers/{id}/sections` | Bearer | Sections in reading order (`limit` ≤ 100) |
+| GET | `/api/v1/papers/{id}/chunks` | Bearer | Retrieval chunks with section heading and page range (`limit` ≤ 50) |
+| GET | `/api/v1/papers/{id}/references` | Bearer | Bibliography parsed by GROBID (`limit` ≤ 100) |
 
 Paper responses never include `storage_key` (server file location), `error_message` (raw processing
 errors) or any filesystem path. Both fields stay in the database for server-side use; a failed paper is
@@ -161,40 +182,55 @@ Nothing is guessed.
 ## PDF text extraction
 
 `POST /api/v1/papers/{paper_id}/extract` reads the stored PDF with **PyMuPDF** and saves the text of
-**every page** as its own row in `paper_pages`, numbered from 1 exactly as in the PDF. Extraction is manual
-and synchronous for now (automatic background processing arrives with Celery on Day 10).
+**every page** as its own row in `paper_pages`, numbered from 1 exactly as in the PDF. Since Day 6 the same
+request also builds sections, retrieval chunks, references and bibliographic metadata (see
+[Document structure](#document-structure-grobid-and-chunking-day-6)). Extraction is manual and synchronous
+for now (automatic background processing arrives with Celery on Day 10).
 
-### Workflow
+### Workflow (Day 6: keep the last good extraction)
 
 ```
 POST /papers/{id}/extract
-  ├─ T1 claim     UPDATE papers SET status='processing' WHERE id, owned, claimable RETURNING storage_key
-  │               + delete old pages, sections and chunks                                   COMMIT
-  ├─ extract      StorageService.resolve(storage_key) → pymupdf, page by page   (thread pool, NO transaction open)
-  │               clean text → classify page → PageExtraction(page_number, text, counts, status, needs_ocr)
-  └─ T2 persist   SELECT … FOR UPDATE; still 'processing'? → one batched INSERT of all pages
-                  + status='processed', page_count, processed_at                            COMMIT
-     or T2 fail   status='failed', failure_code, internal error_message                    COMMIT
+  ├─ T1 claim     UPDATE papers SET status='processing', extraction_claim_id=<new random id>
+  │               WHERE id, owned, claimable                                                 COMMIT
+  │               NOTHING is deleted: the previous extraction stays readable meanwhile.
+  ├─ work         PyMuPDF, page by page            (thread pool, process-wide MuPDF lock, NO transaction)
+  │               → GROBID over HTTP (optional)    (outside the MuPDF lock, NO transaction)
+  │               → TEI parsing + chunking         (thread pool)
+  ├─ T2 replace   SELECT … FOR UPDATE; still OUR claim id? → delete old pages/sections/chunks/references,
+  │               insert the new ones, fill NULL metadata, status='processed'               COMMIT
+  └─ T3 failure   (separate transaction, after rolling back anything that failed; only with OUR claim id)
+                  previous extraction exists → status='processed', kept untouched
+                  otherwise                  → status='failed', failure_code              COMMIT
+                  both: last_extraction_failure_code + last_extraction_attempt_at
 ```
 
-- **Short transactions.** T1 and T2 take milliseconds. The PDF work happens between them, with no
-  database transaction or row lock held.
-- **Atomic pages.** All pages of an extraction are written in one transaction or not at all. A failed or
-  interrupted extraction never leaves old or partial pages behind: pages exist only while the paper's
-  latest extraction has completed (`processed`).
-- **Re-extraction** replaces every page. `UNIQUE (paper_id, page_number)` makes duplicate pages impossible,
-  and derived `paper_sections` / `paper_chunks` are cleared because they would be stale.
+- **Short transactions.** T1, T2 and T3 take milliseconds. PDF work and the GROBID call happen between them,
+  with no database transaction or row lock held.
+- **Atomic replacement.** All pages, sections, chunks and references of an extraction are written in one
+  transaction (T2) together with the deletion of the previous ones, or not at all. A reader sees either the
+  complete previous extraction or the complete new one, never a mix.
+- **A failed re-extraction keeps the last good result.** The paper goes back to `processed`; the attempt is
+  visible in `last_extraction_failure_code` / `last_extraction_attempt_at` and in the response
+  (`status: "failed"`, `retained_previous_extraction: true`, `paper_status: "processed"`).
+- **`processed_at`** is the time of the last **successful** extraction.
 - **One extraction per paper at a time.** The T1 conditional UPDATE acts as the lock, and a second
   request gets **409**. A claim older than `EXTRACTION_STALE_MINUTES` (judged by `papers.updated_at`, which
   the claim sets to the database's `now()`) can be taken over after a crash.
+- **Claim fencing.** Every claim stores a fresh random `extraction_claim_id` (internal, never in a response),
+  and the attempt's T2 and T3 write only while that id is still the paper's current claim. If a slow
+  attempt is declared stale and another request takes over, the old attempt changes nothing at all: its
+  result is discarded with **409** and its failure is not recorded, so the newest claim alone decides the
+  outcome. Leaving `processing` always clears the claim (database CHECK `claim_only_when_processing`).
 
 ### Processing lifecycle
 
 ```
-uploaded ──extract──▶ processing ──▶ processed     (pages saved; some may be flagged needs_ocr)
+uploaded ──extract──▶ processing ──▶ processed     (pages, chunks and maybe sections saved)
                           │
-                          └────────▶ failed        (failure_code set; no pages)
-processed / failed ──extract again──▶ processing …
+                          └────────▶ failed        (failure_code set; no pages)  — first extraction only
+processed ──extract again──▶ processing ──▶ processed (replaced)  or  processed (kept; last_extraction_failure_code set)
+failed    ──extract again──▶ processing …
 ```
 
 ### What a page looks like
@@ -212,6 +248,10 @@ A PDF that is **entirely scanned** is still `processed`: every page is saved wit
 
 ### Handled failures (HTTP 200, `status: "failed"`)
 
+These codes describe a failed **attempt**. On a first extraction the paper becomes `failed` with this
+`failure_code`; on a re-extraction the previous result is kept and the code is stored in
+`last_extraction_failure_code` instead. GROBID problems are never failures (see below).
+
 | `failure_code` | Cause |
 |---|---|
 | `file_missing` | The stored file is gone, or the row's storage key is not a server-generated key (e.g. hand-seeded rows) |
@@ -222,8 +262,9 @@ A PDF that is **entirely scanned** is still `processed`: every page is saved wit
 
 `no_extractable_text` is a reserved code; it is not used today (scanned PDFs are `processed`).
 The technical detail goes to the server log and the internal `papers.error_message` column, never to the
-client. Unexpected errors (bugs) return the generic **500** and also mark the paper `failed` /
-`extraction_error`, so it is never left stuck in `processing`.
+client. Unexpected errors (bugs, including a failed database write in T2) return the generic **500** and are
+recorded through T3 as `extraction_error`, so a paper is never left stuck in `processing` and a previous
+extraction is never lost.
 
 ### Text cleaning (conservative)
 
@@ -263,6 +304,126 @@ licence from Artifex. Using it in this open portfolio project is fine. **Distrib
 a network service commercially** requires either complying with the AGPL (publishing the complete source
 of the service) or buying an Artifex licence.
 
+## Document structure (GROBID and chunking, Day 6)
+
+### Two paths, one result shape
+
+| | GROBID used | Page fallback |
+|---|---|---|
+| When | `GROBID_ENABLED=true` and GROBID returns usable TEI | GROBID disabled, unreachable, busy, slow, or returned unusable TEI |
+| `structure_source` / `grobid_outcome` | `grobid` / `used` | `page_fallback` / `disabled`, `unavailable`, `timeout`, `invalid_response` or `error` |
+| Sections | Yes: headings, levels (`2.1` → level 2), types, exact page ranges | None |
+| Chunks | Per section, never crossing a section | Over the page text in reading order |
+| References | Parsed bibliography with raw string, title, authors, year, venue, DOI, pages | None |
+| Metadata (title, authors, abstract, year, DOI, venue) | Filled where the paper's field is empty | Never touched |
+
+**GROBID never makes an extraction fail.** PyMuPDF decides success; GROBID only adds structure.
+The pair (`structure_source`, `grobid_outcome`) is enforced by a database CHECK constraint, so a paper can
+never claim GROBID structure without GROBID having been used.
+
+The GROBID request is fixed by the server: `consolidateHeader=0` and `consolidateCitations=0` (GROBID does
+**not** contact CrossRef or any external service, so paper content never leaves your machine),
+`includeRawCitations=1`, `segmentSentences=1`, `teiCoordinates=p,head,s,biblStruct,figure,formula`. The PDF is sent as
+`paper.pdf`, never under the user's filename. One retry after a 503 (busy); total deadline
+`GROBID_TIMEOUT_SECONDS`; responses over 64 MB are rejected; proxy environment variables are ignored.
+
+### Metadata policy: fill only empty fields
+
+Extraction writes a bibliographic field **only while it is empty (SQL NULL)**. Anything already present,
+typed by you via `PATCH` or filled by an earlier extraction, is never overwritten; an explicit empty author
+list `[]` counts as a value. Every extracted value passes the same validation as a manual edit (length limits,
+year 1800–2100, DOI format); invalid values are dropped. The SQL itself uses `COALESCE(column, :value)` as a
+second guard. `metadata_fields_filled` in the response lists what was filled. To have a field filled again,
+clear it with `PATCH {"field": null}` and re-extract.
+
+### Sections
+
+GROBID's body divisions become `paper_sections` rows in reading order: the abstract first, then numbered
+sections and subsections, then back matter such as acknowledgements.
+
+- **Numbers** are kept apart from the heading: `section_number` is `"II."`, `"B."` or `"3.2"` as printed, and
+  `heading` is the title only. The level follows the numbering style: Roman → 1, letter → 2, `3.2` → 2.
+- **Types** come from conservative heading phrases (`introduction`, `related_work` including "literature
+  review/studies", `methodology` including "methods", `experiments`, `results`, `discussion`, `conclusion`,
+  `abstract`, `other`). Generic words such as "model", "framework", "overview", "motivation" or "summary" do not
+  decide a type. An unclassified subsection inherits its parent's type (`A. Pipeline` under `VII. Methodology`).
+  Anything else stays `other`, with its heading kept.
+- A heading with no text of its own (a parent directly followed by a subsection) is kept with empty `text`,
+  so the outline is complete.
+- Formulas and figure captions are kept in their section. Footnotes and the bibliography are not section text.
+
+**Heading repair from PDF evidence** (`structure_repair.py`). GROBID's heading detection is statistical, and on
+papers whose headings use the body font it splits, merges or misses them. Before chunking, these cases are
+corrected, but **only when the heading is printed as a line of its own in the PDF text** (`II.` followed by the
+line `RELATED WORK OR LITERATURE STUDIES`, or one line `VI. Results And Discussion`). Without that evidence,
+nothing changes. Text is moved, never invented or dropped.
+
+| GROBID output | Repaired to |
+|---|---|
+| heading `II.`, title at the start of the paragraph | heading `RELATED WORK OR LITERATURE STUDIES`, number `II.` |
+| heading `PROBLEM DOMAIN`, stray `IV.` ending the previous paragraph | number `IV.`; the fragment is removed (it moved) |
+| heading `TABLE I. <caption> B. Behavioral Feature Distribution` | heading `Behavioral Feature Distribution` (`B.`); caption kept as a caption block where it is printed |
+| heading `DTI = … Income(1)` | a formula in the previous section; its text stays there |
+| `… product mapping. VI. Results And Discussion This section …` inside a paragraph | a new section `VI. Results And Discussion` from that point on |
+
+Only Roman and letter numbering is used as evidence; numbered list items (`1. Load the data`) never are.
+If the repair itself fails, GROBID's structure is used as it is.
+
+### Chunks
+
+| Rule | Value |
+|---|---|
+| Target size | 350 words (`CHUNK_TARGET_WORDS`) |
+| Hard maximum | 500 words (`CHUNK_MAX_WORDS`), never exceeded |
+| Small remainders | a trailing chunk under 60 words (`CHUNK_MIN_WORDS`) is merged into the previous chunk of the same section if it fits |
+| Overlap | none |
+| Boundaries | whole paragraphs; long paragraphs split at sentence boundaries; a single sentence over the maximum is split at word boundaries |
+| Tables | `content_type = "table"` chunks, never packed together with prose; long tables are split at sentence and word boundaries |
+| Kept as prose | formulas and figure captions, in reading order (`content_type = "text"`) |
+| Never chunked | footnotes, the bibliography (in the fallback: everything after a "References"/"Bibliography" heading in the second half of the document) |
+| Pages | exact 1-based `page_start`/`page_end`: GROBID coordinates, else the page whose text contains the paragraph, else the preceding paragraph's page |
+
+**Tables.** Tables GROBID recognises (`<figure type="table">`) keep their caption and cells, one row per line,
+cells separated by ` | `. When GROBID returns table cells as ordinary paragraphs, which is common, PyMuPDF's
+table finder locates the table on the page. Sentences whose PDF boxes lie at least 60 % inside that region
+become the table block, and the remaining sentences stay prose. This works for ruled tables on unrotated
+pages. A table without ruling lines is not detected and stays prose; nothing is guessed. Disable it with
+`EXTRACTION_DETECT_TABLES=false`. It costs about 0.1 s per page and runs only when GROBID's output is used.
+
+**`token_count` is measured by `token_count_method`.** The Day 6 default is `word_proxy`: whitespace-separated
+words, not model tokens. `CHUNK_TOKEN_COUNTER=tokenizer` with `CHUNK_TOKENIZER_FILE=<local tokenizer.json>`
+(and the optional `tokenizers` package) counts real tokens instead and labels them `tokenizer:<name>`.
+Nothing is ever downloaded: a missing file or package falls back to `word_proxy` with a warning, and the label
+says so. Chunks that existed before migration 0003 are labelled `unknown`, and chunks from before migration 0004
+have `content_type = null`. Day 7 switches to the embedding model's tokenizer and will not embed `word_proxy`
+or `unknown` chunks.
+
+### GROBID service
+
+`docker compose up -d grobid` starts `grobid/grobid:0.9.1-crf` (Apache-2.0; CRF models only, CPU, ~500 MB
+image, needs about 4 GB of RAM while processing) on `127.0.0.1:8070` only. It stores nothing, so it has no
+volume. Check it with `GET /api/v1/health/grobid` or `docker compose ps` (health check on `/api/isalive`).
+Pin the image after the first pull:
+`docker image inspect grobid/grobid:0.9.1-crf --format "{{index .RepoDigests 0}}"`.
+
+### Structure limitations
+
+- GROBID's segmentation is statistical: headings, section types, author lists and references can be wrong or
+  missing on unusual layouts. Values it cannot determine stay `null`; nothing is invented.
+- `section_type` comes from heading phrases; a section titled e.g. "Our Pipeline" is `other`.
+- Heading repair needs the heading printed as its own line. Headings GROBID missed that never appear like that
+  stay where GROBID put them.
+- A table row that GROBID placed in a later section (wrong reading order) is marked as a table there. It is not
+  moved back, and a table spanning two pages becomes two table blocks (joining them is deferred, to avoid
+  reassigning content wrongly).
+- Figure captions are placed by (page, y) position, which can be off within a page of a two-column layout.
+- GROBID joins hyphenated compounds at line ends (`data-intensive` → `dataintensive`). This is GROBID's own text.
+- When a paragraph has no coordinates and its text cannot be found on any page (e.g. GROBID de-hyphenated a
+  word that PyMuPDF kept split), it is given the preceding paragraph's page. The server logs how many.
+- The fallback has no section structure and finds the bibliography with a heading heuristic.
+- Chunk sizes are in words until Day 7.
+- The GROBID call is synchronous and can take tens of seconds for a long paper; Day 10 moves it to Celery.
+
 ## File storage architecture
 
 ```
@@ -300,11 +461,11 @@ PDF renamed to `.txt`. For extraction checks, a scanned PDF (image-only) and a p
 
 ```powershell
 cd D:\Projects\Synthora
-docker compose up -d; docker compose ps          # postgres must be "healthy"
+docker compose up -d; docker compose ps          # postgres "healthy"; grobid "healthy" after ~1 min
 cd backend; .\.venv\Scripts\Activate.ps1
-pip install -r requirements-dev.txt              # Day 5 adds PyMuPDF
-alembic upgrade head                             # applies 0002 (paper_pages, failure_code)
-alembic current                                  # expect: 0002 (head)
+pip install -r requirements-dev.txt              # Day 6 adds httpx2 (GROBID client)
+alembic upgrade head                             # back up first (PROGRESS.md, Day 6); applies 0003
+alembic current                                  # expect: 0003 (head)
 uvicorn app.main:app --reload                    # open http://127.0.0.1:8000/docs
 ```
 
@@ -347,16 +508,30 @@ In `POST /api/v1/workspaces/{workspace_id}/papers`, click **Try it out**, paste 
 | Scanned PDF | upload a scanned PDF (no text layer), extract | 200 `processed`, `needs_ocr_pages` = `page_count`, empty texts |
 | Encrypted PDF | upload a PDF with an open password, extract | 200 `status: "failed"`, `failure_code: "pdf_encrypted"`; `GET …/pages` → empty |
 
-### 6. Cross-user isolation
+### 6. Structure (Day 6)
+| Step | Request | Expected |
+|---|---|---|
+| GROBID up | `GET /api/v1/health/grobid` | 200 `{"status": "ok"}` (or `disabled` if `GROBID_ENABLED=false`) |
+| Extract | `POST /api/v1/papers/{paper_id}/extract` on a real paper | 200, `structure_source: "grobid"`, `grobid_outcome: "used"`, sensible `section_count`, `chunk_count`, `reference_count` |
+| Metadata | `GET /api/v1/papers/{paper_id}` | title, authors, abstract, year, DOI and venue filled **only** where they were empty; compare with the PDF |
+| Sections | `GET …/sections` | headings in reading order with page ranges matching the PDF viewer |
+| Chunks | `GET …/chunks` | every `token_count` ≤ 500, `token_count_method: "word_proxy"`, page ranges match where the text is in the PDF |
+| References | `GET …/references` | one entry per bibliography item, in order |
+| Manual edit wins | `PATCH` a different title, extract again | title unchanged, `metadata_fields_filled` without `title` |
+| GROBID down | `docker compose stop grobid`, extract again | 200 `processed`, `structure_source: "page_fallback"`, `grobid_outcome: "unavailable"`, sections/references now empty, metadata kept; `docker compose start grobid` afterwards |
+| Failed re-run keeps data | temporarily rename the stored PDF under `storage\papers\…`, extract | 200 `status: "failed"`, `retained_previous_extraction: true`; `GET …/chunks` unchanged; rename it back |
+
+### 7. Cross-user isolation
 Log out, register `other@example.com` and authorize as that user. Then:
 - upload into the demo user's workspace;
 - `GET`, `PATCH` and `DELETE` one of the demo user's papers;
-- `POST …/extract`, `GET …/pages` and `GET …/pages/1` on one of the demo user's papers.
+- `POST …/extract`, `GET …/pages`, `GET …/pages/1`, `GET …/sections`, `GET …/chunks` and `GET …/references`
+  on one of the demo user's papers.
 
 All must return **404**, and the demo user's file must still be on disk.
 
-### 7. Clean up
-Delete demo papers with `DELETE /api/v1/papers/{id}`, which removes the files and the extracted pages too. Rows seeded by hand
+### 8. Clean up
+Delete demo papers with `DELETE /api/v1/papers/{id}`, which removes the files and all extracted content too. Rows seeded by hand
 during Day 3 testing (keys starting `manual/`) have no file. Deleting them works and logs
 "invalid storage key; nothing was deleted" on the server.
 
@@ -365,4 +540,6 @@ during Day 3 testing (keys starting `manual/`) have no file. Deleting them works
 - Postgres is published on `127.0.0.1:5433` (not 5432) to avoid clashing with a native Postgres install.
 - `infra/postgres/init/*.sql` only runs when the data volume is empty. Alembic is the source of truth for the schema.
 - Never run `docker compose down -v`: `-v` deletes the database volume.
-- Pin the image after first pull: `docker image inspect pgvector/pgvector:pg16 --format "{{index .RepoDigests 0}}"`.
+- Pin the images after first pull: `docker image inspect pgvector/pgvector:pg16 --format "{{index .RepoDigests 0}}"`
+  (same for `grobid/grobid:0.9.1-crf`).
+- GROBID is published on `127.0.0.1:8070` only; it has no authentication.

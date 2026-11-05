@@ -1,5 +1,4 @@
 -r requirements.txt
 pytest==9.2.0
 pytest-asyncio==1.4.1
-# Starlette's TestClient now expects httpx2 (plain httpx triggers a deprecation warning).
-httpx2==2.16.0
+# httpx2 (used by Starlette's TestClient) now comes from requirements.txt (Day 6).

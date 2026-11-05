@@ -30,7 +30,7 @@ from tests.conftest import TEST_JWT_SECRET
 from tests.db_safety import assert_safe_test_database
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
-APP_TABLES = ("paper_pages", "paper_chunks", "paper_sections", "papers", "workspaces", "users")
+APP_TABLES = ("paper_references", "paper_pages", "paper_chunks", "paper_sections", "papers", "workspaces", "users")
 
 
 class _TestDatabaseSettings(BaseSettings):
@@ -140,6 +140,8 @@ def build_api_client(
     monkeypatch.setenv("JWT_SECRET_KEY", TEST_JWT_SECRET)
     monkeypatch.setenv("ENVIRONMENT", "test")
     monkeypatch.setenv("PAPER_STORAGE_DIR", str(storage_root))
+    # Never reach a real GROBID unless a test opts in (tests inject a fake client instead).
+    monkeypatch.setenv("GROBID_ENABLED", "false")
     for key, value in extra_env.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()

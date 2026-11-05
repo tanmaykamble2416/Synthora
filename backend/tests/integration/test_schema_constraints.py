@@ -58,6 +58,7 @@ def _chunk(paper: Paper, *, index: int = 0, section_id: uuid.UUID | None = None,
         chunk_index=index,
         text="chunk text",
         token_count=3,
+        token_count_method="word_proxy",
         page_start=1,
         page_end=1,
     )
@@ -147,7 +148,9 @@ async def test_chunk_workspace_must_match_paper_workspace(db_session: AsyncSessi
 async def test_orm_relationship_fills_both_composite_fk_columns(db_session: AsyncSession) -> None:
     ws = await _workspace(db_session, await _user(db_session))
     paper = await _paper(db_session, ws)
-    chunk = PaperChunk(paper=paper, chunk_index=0, text="t", token_count=1, page_start=1, page_end=1)
+    chunk = PaperChunk(
+        paper=paper, chunk_index=0, text="t", token_count=1, token_count_method="word_proxy", page_start=1, page_end=1
+    )
     db_session.add(chunk)
     await db_session.commit()
     assert (chunk.paper_id, chunk.workspace_id) == (paper.id, ws.id)
@@ -163,6 +166,11 @@ async def test_orm_relationship_fills_both_composite_fk_columns(db_session: Asyn
         ({"page_start": 0, "page_end": 1}, "ck_paper_chunks_page_range_valid"),
         ({"token_count": 0}, "ck_paper_chunks_token_count_positive"),
         ({"chunk_index": -1}, "ck_paper_chunks_chunk_index_non_negative"),
+        ({"token_count_method": "words"}, "ck_paper_chunks_token_count_method_valid"),
+        ({"token_count_method": "tokenizer"}, "ck_paper_chunks_token_count_method_valid"),
+        ({"token_count_method": ""}, "ck_paper_chunks_token_count_method_valid"),
+        ({"content_type": "image"}, "ck_paper_chunks_content_type_valid"),
+        ({"content_type": ""}, "ck_paper_chunks_content_type_valid"),
     ],
 )
 async def test_chunk_check_constraints(db_session: AsyncSession, overrides: dict, constraint: str) -> None:
@@ -274,3 +282,97 @@ async def test_deleting_user_cascades_to_everything(db_session: AsyncSession) ->
         assert (await db_session.execute(select(func.count()).select_from(model))).scalar_one() == 0
     remaining = (await db_session.execute(select(Workspace.id))).scalars().all()
     assert remaining == [survivor_ws.id]
+
+
+# --- Day 6: provenance and references -------------------------------------------------------
+# These include the NULL cases on purpose: a comparison with NULL yields NULL, which a
+# CHECK constraint accepts, so each constraint must test IS NOT NULL explicitly.
+
+
+@pytest.mark.parametrize(
+    ("values", "valid"),
+    [
+        ({}, True),
+        ({"structure_source": "grobid", "grobid_outcome": "used"}, True),
+        ({"structure_source": "page_fallback", "grobid_outcome": "disabled"}, True),
+        ({"structure_source": "page_fallback", "grobid_outcome": "timeout"}, True),
+        ({"structure_source": "grobid"}, False),
+        ({"grobid_outcome": "used"}, False),
+        ({"structure_source": "page_fallback"}, False),
+        ({"grobid_outcome": "timeout"}, False),
+        ({"structure_source": "grobid", "grobid_outcome": "timeout"}, False),
+        ({"structure_source": "page_fallback", "grobid_outcome": "used"}, False),
+        ({"structure_source": "ocr", "grobid_outcome": "used"}, False),
+        ({"structure_source": "page_fallback", "grobid_outcome": "maybe"}, False),
+        ({"last_extraction_failure_code": "pdf_encrypted"}, True),
+        ({"last_extraction_failure_code": "nope"}, False),
+    ],
+)
+async def test_paper_provenance_constraints(db_session: AsyncSession, values: dict, valid: bool) -> None:
+    ws = await _workspace(db_session, await _user(db_session))
+    paper = await _paper(db_session, ws)
+    paper_id = paper.id  # read before commit: attributes expire on commit
+    await db_session.commit()
+    stmt = text(
+        "UPDATE papers SET " + ", ".join(f"{k} = :{k}" for k in values) + " WHERE id = :id"
+    ) if values else text("UPDATE papers SET title = title WHERE id = :id")
+    if valid:
+        await db_session.execute(stmt, {**values, "id": paper_id})
+        await db_session.commit()
+    else:
+        with pytest.raises(IntegrityError) as exc_info:
+            await db_session.execute(stmt, {**values, "id": paper_id})
+        assert violated_constraint(exc_info.value).startswith("ck_papers_")
+        await db_session.rollback()
+
+
+@pytest.mark.parametrize(
+    ("values", "constraint"),
+    [
+        ({"raw_text": None, "title": None}, "ck_paper_references_has_content"),
+        ({"page_start": 2, "page_end": None}, "ck_paper_references_page_range_valid"),
+        ({"page_start": None, "page_end": 2}, "ck_paper_references_page_range_valid"),
+        ({"page_start": 3, "page_end": 2}, "ck_paper_references_page_range_valid"),
+        ({"page_start": 0, "page_end": 0}, "ck_paper_references_page_range_valid"),
+        ({"publication_year": 1700}, "ck_paper_references_publication_year_range"),
+        ({"ref_index": -1}, "ck_paper_references_ref_index_non_negative"),
+    ],
+)
+async def test_reference_constraints(db_session: AsyncSession, values: dict, constraint: str) -> None:
+    from app.models import PaperReference
+
+    ws = await _workspace(db_session, await _user(db_session))
+    paper = await _paper(db_session, ws)
+    reference = PaperReference(paper_id=paper.id, ref_index=0, raw_text="r")
+    for key, value in values.items():
+        setattr(reference, key, value)
+    await _expect_violation(db_session, reference, constraint)
+
+
+async def test_valid_reference_and_unique_index(db_session: AsyncSession) -> None:
+    from app.models import PaperReference
+
+    ws = await _workspace(db_session, await _user(db_session))
+    paper = await _paper(db_session, ws)
+    db_session.add(PaperReference(paper_id=paper.id, ref_index=0, title="t", page_start=2, page_end=3, authors=None))
+    await db_session.commit()
+    await _expect_violation(
+        db_session, PaperReference(paper_id=paper.id, ref_index=0, raw_text="dup"), "uq_paper_references_paper_id_ref_index"
+    )
+
+
+async def test_chunk_without_token_count_method_is_rejected(db_session: AsyncSession) -> None:
+    ws = await _workspace(db_session, await _user(db_session))
+    paper = await _paper(db_session, ws)
+    ids = {"p": paper.id, "w": ws.id}
+    await db_session.commit()
+    with pytest.raises(IntegrityError) as exc_info:
+        await db_session.execute(
+            text(
+                "INSERT INTO paper_chunks (paper_id, workspace_id, chunk_index, text, token_count, page_start, page_end) "
+                "VALUES (:p, :w, 0, 't', 1, 1, 1)"
+            ),
+            ids,
+        )
+    assert "token_count_method" in str(exc_info.value.orig)
+    await db_session.rollback()

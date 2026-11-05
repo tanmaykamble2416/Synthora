@@ -12,6 +12,7 @@ from app.core.security import INVALID_TOKEN_MESSAGE, decode_access_token
 from app.db.session import get_db_session
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
+from app.services.grobid_client import GrobidClient
 from app.services.storage_service import StorageService
 
 # auto_error=False: we raise our own AuthenticationError so the error shape is consistent.
@@ -45,3 +46,13 @@ def get_storage(settings: SettingsDep) -> StorageService:
 
 
 StorageDep = Annotated[StorageService, Depends(get_storage)]
+
+
+def get_grobid_client(settings: SettingsDep) -> GrobidClient | None:
+    """None when GROBID_ENABLED=false: extraction then uses the page fallback directly."""
+    if not settings.grobid_enabled:
+        return None
+    return GrobidClient(settings.grobid_url, timeout_seconds=settings.grobid_timeout_seconds)
+
+
+GrobidDep = Annotated[GrobidClient | None, Depends(get_grobid_client)]

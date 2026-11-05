@@ -6,8 +6,9 @@ import time
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.core.exceptions import DatabaseUnavailableError, ExtensionMissingError
-from app.schemas.health import DatabaseHealthResponse
+from app.core.exceptions import DatabaseUnavailableError, ExtensionMissingError, GrobidUnavailableError
+from app.schemas.health import DatabaseHealthResponse, GrobidHealthResponse
+from app.services.grobid_client import GrobidClient
 
 logger = logging.getLogger(__name__)
 
@@ -52,3 +53,16 @@ async def check_database(engine: AsyncEngine) -> DatabaseHealthResponse:
         pgvector_version=pgvector_version,
         latency_ms=latency_ms,
     )
+
+
+async def check_grobid(client: GrobidClient | None) -> GrobidHealthResponse:
+    """GROBID is optional: "disabled" is a healthy state. Raises GrobidUnavailableError (503)
+    when it is enabled but GET /api/isalive does not answer "true"."""
+    if client is None:
+        return GrobidHealthResponse(status="disabled", latency_ms=None)
+    alive, latency_ms = await client.is_alive()
+    if not alive:
+        raise GrobidUnavailableError(
+            "GROBID is enabled but not reachable; extraction falls back to page-based chunks."
+        )
+    return GrobidHealthResponse(status="ok", latency_ms=latency_ms)

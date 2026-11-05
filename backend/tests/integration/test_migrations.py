@@ -10,8 +10,8 @@ from sqlalchemy.pool import NullPool
 
 from alembic import command
 
-APP_TABLES = {"users", "workspaces", "papers", "paper_sections", "paper_chunks", "paper_pages"}
-HEAD_REVISION = "0002"
+APP_TABLES = {"users", "workspaces", "papers", "paper_sections", "paper_chunks", "paper_pages", "paper_references"}
+HEAD_REVISION = "0004"
 
 
 def _query(url: URL, sql: str) -> list[tuple]:
@@ -99,3 +99,190 @@ def test_failure_code_constraints_exist(test_db_url: URL) -> None:
         )
     }
     assert {"ck_papers_failure_code_valid", "ck_papers_failure_code_only_when_failed"} <= names
+
+
+# --- Day 6: migration 0003 ---------------------------------------------------------------
+
+_USER = "00000000-0000-0000-0000-00000000d601"
+_WS = "00000000-0000-0000-0000-00000000d602"
+_PROCESSED = "00000000-0000-0000-0000-00000000d603"
+_FAILED = "00000000-0000-0000-0000-00000000d604"
+_SECTION = "00000000-0000-0000-0000-00000000d605"
+
+
+def _execute(url: URL, *statements: str) -> None:
+    async def run() -> None:
+        engine = create_async_engine(url, poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                assert (await conn.execute(text("SELECT current_database()"))).scalar_one().endswith("_test")
+                for statement in statements:
+                    await conn.execute(text(statement))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def _seed_day5_rows(url: URL) -> None:
+    """Rows exactly as Day 5 code (schema 0002) would have written them."""
+    _execute(
+        url,
+        f"INSERT INTO users (id, email, hashed_password) VALUES ('{_USER}', 'mig@example.com', 'x')",
+        f"INSERT INTO workspaces (id, owner_id, name) VALUES ('{_WS}', '{_USER}', 'W')",
+        "INSERT INTO papers (id, workspace_id, original_filename, storage_key, sha256, file_size_bytes, status, "
+        f"page_count, processed_at) VALUES ('{_PROCESSED}', '{_WS}', 'p.pdf', 'mig-k1', repeat('a', 64), 10, "
+        "'processed', 1, '2026-11-01 10:00+00')",
+        "INSERT INTO papers (id, workspace_id, original_filename, storage_key, sha256, file_size_bytes, status, "
+        f"failure_code, error_message, processed_at) VALUES ('{_FAILED}', '{_WS}', 'f.pdf', 'mig-k2', "
+        "repeat('b', 64), 10, 'failed', 'pdf_encrypted', 'internal', '2026-11-02 11:00+00')",
+        "INSERT INTO paper_pages (paper_id, page_number, text, char_count, word_count, extraction_status) "
+        f"VALUES ('{_PROCESSED}', 1, 'hello world', 10, 2, 'low_text')",
+        "INSERT INTO paper_sections (id, paper_id, order_index, text, page_start, page_end) "
+        f"VALUES ('{_SECTION}', '{_PROCESSED}', 0, 's', 1, 1)",
+        "INSERT INTO paper_chunks (paper_id, workspace_id, section_id, chunk_index, text, token_count, page_start, "
+        f"page_end) VALUES ('{_PROCESSED}', '{_WS}', '{_SECTION}', 0, 'old chunk', 7, 1, 1), "
+        f"('{_PROCESSED}', '{_WS}', NULL, 1, 'old chunk 2', 3, 1, 1)",
+    )
+
+
+def _remove_seed(url: URL) -> None:
+    _execute(url, f"DELETE FROM users WHERE id = '{_USER}'")  # cascades to everything seeded
+
+
+_DAY5_STATE_SQL = (
+    "SELECT p.id::text, p.status, p.page_count, p.failure_code, p.error_message, p.processed_at, p.updated_at, "
+    "(SELECT count(*) FROM paper_pages pp WHERE pp.paper_id = p.id), "
+    "(SELECT array_agg(c.id::text || ':' || c.token_count || ':' || c.text ORDER BY c.chunk_index) "
+    " FROM paper_chunks c WHERE c.paper_id = p.id) "
+    f"FROM papers p WHERE p.workspace_id = '{_WS}' ORDER BY p.id"
+)
+
+
+def test_0003_upgrade_labels_existing_chunks_unknown_and_backfills(alembic_config: Config, test_db_url: URL) -> None:
+    command.downgrade(alembic_config, "0002")
+    try:
+        _seed_day5_rows(test_db_url)
+        day5_state = _query(test_db_url, _DAY5_STATE_SQL)
+
+        command.upgrade(alembic_config, "0003")
+
+        # Safeguard 1: existing chunks are 'unknown' (never 'word_proxy'); token_count untouched.
+        assert _query(
+            test_db_url,
+            f"SELECT chunk_index, token_count, token_count_method FROM paper_chunks WHERE paper_id = '{_PROCESSED}' "
+            "ORDER BY 1",
+        ) == [(0, 7, "unknown"), (1, 3, "unknown")]
+        assert _query(
+            test_db_url,
+            "SELECT is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_name = 'paper_chunks' AND column_name = 'token_count_method'",
+        ) == [("NO", None)]  # NOT NULL, and no default left behind
+        comment = _query(
+            test_db_url,
+            "SELECT col_description('paper_chunks'::regclass, attnum) FROM pg_attribute "
+            "WHERE attrelid = 'paper_chunks'::regclass AND attname = 'token_count'",
+        )[0][0]
+        assert "word_proxy" in comment and "NOT tokenizer tokens" in comment
+
+        rows = {
+            r[0]: r[1:]
+            for r in _query(
+                test_db_url,
+                "SELECT id::text, status, failure_code, processed_at IS NULL, last_extraction_failure_code, "
+                "last_extraction_attempt_at::text, structure_source, grobid_outcome, extraction_claim_id FROM papers "
+                f"WHERE workspace_id = '{_WS}'",
+            )
+        }
+        assert rows[_PROCESSED] == ("processed", None, False, None, "2026-11-01 10:00:00+00", None, None, None)
+        assert rows[_FAILED] == (
+            "failed", "pdf_encrypted", True, "pdf_encrypted", "2026-11-02 11:00:00+00", None, None, None,
+        )
+
+        command.downgrade(alembic_config, "0002")
+        assert _query(test_db_url, _DAY5_STATE_SQL) == day5_state  # exact round trip, updated_at included
+    finally:
+        command.upgrade(alembic_config, "head")
+        _remove_seed(test_db_url)
+
+
+def test_step_downgrade_to_0002_and_back(alembic_config: Config, test_db_url: URL) -> None:
+    command.downgrade(alembic_config, "0002")
+    assert "paper_references" not in _tables(test_db_url)
+    leftover = _query(
+        test_db_url,
+        "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public' AND "
+        "column_name IN ('token_count_method', 'venue', 'structure_source', 'grobid_outcome', "
+        "'last_extraction_failure_code', 'last_extraction_attempt_at', 'extraction_claim_id')",
+    )
+    assert leftover == []
+    assert not [r for r in _query(test_db_url, "SELECT conname FROM pg_constraint") if "structure" in r[0]]
+    command.upgrade(alembic_config, "head")
+    assert _query(test_db_url, "SELECT version_num FROM alembic_version") == [(HEAD_REVISION,)]
+
+
+def test_0003_constraints_exist(test_db_url: URL) -> None:
+    names = {r[0] for r in _query(test_db_url, "SELECT conname FROM pg_constraint WHERE contype = 'c'")}
+    assert {
+        "ck_papers_structure_source_valid",
+        "ck_papers_grobid_outcome_valid",
+        "ck_papers_structure_outcome_consistent",
+        "ck_papers_last_extraction_failure_code_valid",
+        "ck_papers_claim_only_when_processing",
+        "ck_paper_chunks_token_count_method_valid",
+        "ck_paper_references_page_range_valid",
+        "ck_paper_references_has_content",
+        "ck_paper_references_publication_year_range",
+        "ck_paper_references_ref_index_non_negative",
+    } <= names
+
+
+# --- Day 6 quality pass: migration 0004 -------------------------------------------------------
+
+
+def test_step_downgrade_to_0003_and_back(alembic_config: Config, test_db_url: URL) -> None:
+    """0004 only adds two nullable columns and one CHECK; downgrade removes exactly those."""
+    command.downgrade(alembic_config, "0003")
+    leftover = _query(
+        test_db_url,
+        "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public' AND "
+        "((table_name = 'paper_sections' AND column_name = 'section_number') OR "
+        "(table_name = 'paper_chunks' AND column_name = 'content_type'))",
+    )
+    assert leftover == []
+    command.upgrade(alembic_config, "head")
+    columns = _query(
+        test_db_url,
+        "SELECT table_name, column_name, is_nullable, column_default FROM information_schema.columns "
+        "WHERE (table_name, column_name) IN (('paper_sections', 'section_number'), ('paper_chunks', 'content_type')) "
+        "ORDER BY 1",
+    )
+    assert columns == [("paper_chunks", "content_type", "YES", None), ("paper_sections", "section_number", "YES", None)]
+
+
+def test_0004_leaves_existing_rows_unclassified(alembic_config: Config, test_db_url: URL) -> None:
+    command.downgrade(alembic_config, "0003")
+    try:
+        _execute(
+            test_db_url,
+            f"INSERT INTO users (id, email, hashed_password) VALUES ('{_USER}', 'm4@example.com', 'x')",
+            f"INSERT INTO workspaces (id, owner_id, name) VALUES ('{_WS}', '{_USER}', 'W')",
+            "INSERT INTO papers (id, workspace_id, original_filename, storage_key, sha256, file_size_bytes, status, page_count) "
+            f"VALUES ('{_PROCESSED}', '{_WS}', 'p.pdf', 'm4-k', repeat('e', 64), 1, 'processed', 1)",
+            f"INSERT INTO paper_sections (id, paper_id, order_index, heading, text, page_start, page_end) VALUES ('{_SECTION}', '{_PROCESSED}', 0, 'II.', 't', 1, 1)",
+            "INSERT INTO paper_chunks (paper_id, workspace_id, section_id, chunk_index, text, token_count, token_count_method, page_start, page_end) "
+            f"VALUES ('{_PROCESSED}', '{_WS}', '{_SECTION}', 0, 'c', 1, 'word_proxy', 1, 1)",
+        )
+        before = _query(test_db_url, f"SELECT heading, text, updated_at FROM paper_sections WHERE paper_id = '{_PROCESSED}'")
+        command.upgrade(alembic_config, "head")
+        assert _query(test_db_url, f"SELECT section_number FROM paper_sections WHERE paper_id = '{_PROCESSED}'") == [(None,)]
+        assert _query(test_db_url, f"SELECT content_type FROM paper_chunks WHERE paper_id = '{_PROCESSED}'") == [(None,)]
+        assert _query(test_db_url, f"SELECT heading, text, updated_at FROM paper_sections WHERE paper_id = '{_PROCESSED}'") == before
+    finally:
+        command.upgrade(alembic_config, "head")
+        _remove_seed(test_db_url)
+
+
+def test_0004_constraint_exists(test_db_url: URL) -> None:
+    names = {r[0] for r in _query(test_db_url, "SELECT conname FROM pg_constraint WHERE contype = 'c'")}
+    assert "ck_paper_chunks_content_type_valid" in names

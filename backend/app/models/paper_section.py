@@ -33,6 +33,9 @@ class PaperSection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     order_index: Mapped[int] = mapped_column(Integer, nullable=False)
     level: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     heading: Mapped[str | None] = mapped_column(Text)
+    # Printed section number as it appears in the paper ("II.", "B.", "3.2"); NULL when the
+    # paper has none or the section was stored before migration 0004 (Day 6 quality pass).
+    section_number: Mapped[str | None] = mapped_column(String(20))
     section_type: Mapped[str] = mapped_column(String(30), nullable=False, server_default="other")
     text: Mapped[str] = mapped_column(Text, nullable=False)
     page_start: Mapped[int] = mapped_column(Integer, nullable=False)

@@ -1,7 +1,7 @@
 import re
 import uuid
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
@@ -16,7 +16,7 @@ _DOI_PATTERN = re.compile(r"^10\.\d{4,9}/\S+$")
 _DOI_PREFIXES = ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/", "doi:")
 
 
-def _normalize_doi(value: str) -> str:
+def normalize_doi(value: str) -> str:
     lowered = value.lower()
     for prefix in _DOI_PREFIXES:
         if lowered.startswith(prefix):
@@ -30,9 +30,10 @@ def _normalize_doi(value: str) -> str:
 Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
 Abstract = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
 Doi = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255), AfterValidator(_normalize_doi)
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255), AfterValidator(normalize_doi)
 ]
 PublicationYear = Annotated[int, Field(ge=PUBLICATION_YEAR_MIN, le=PUBLICATION_YEAR_MAX)]
+Venue = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
 
 
 class AuthorIn(InputSchema):
@@ -40,19 +41,24 @@ class AuthorIn(InputSchema):
     affiliation: Annotated[str, StringConstraints(min_length=1, max_length=500)] | None = None
 
 
+Authors = Annotated[list[AuthorIn], Field(max_length=MAX_AUTHORS)]
+
+
 class PaperUpdate(InputSchema):
     """Client-editable bibliographic metadata only.
 
     extra='forbid' (from InputSchema) rejects every other field, including internal
     processing state: id, workspace_id, storage_key, sha256, file_size_bytes, status,
-    error_message, processed_at, owner_id. Send null to clear a field.
+    error_message, processed_at, owner_id, structure_source, grobid_outcome.
+    Send null to clear a field (extraction may then fill it again from GROBID).
     """
 
     title: Title | None = None
     abstract: Abstract | None = None
-    authors: Annotated[list[AuthorIn], Field(max_length=MAX_AUTHORS)] | None = None
+    authors: Authors | None = None
     publication_year: PublicationYear | None = None
     doi: Doi | None = None
+    venue: Venue | None = None
 
     @model_validator(mode="after")
     def _require_at_least_one_field(self) -> "PaperUpdate":
@@ -77,11 +83,21 @@ class PaperRead(OutputSchema):
 
     Deliberately omitted internal fields (they stay in the database for server-side use):
       * storage_key: the server's file location.
+      * extraction_claim_id: internal fencing token of the running extraction (Day 6).
       * error_message: raw processing errors can contain file paths, hostnames or
         stack-trace fragments. Clients see status == "failed" plus failure_code;
         operators use the DB column and server logs.
 
     failure_code (Day 5) is the user-safe reason: a fixed code, never free text.
+
+    Day 6:
+      * processed_at: when the stored extraction (pages, sections, chunks) finished.
+      * last_extraction_failure_code / last_extraction_attempt_at: the most recent
+        attempt. A failed re-extraction keeps the previous result, so a paper can be
+        status "processed" with last_extraction_failure_code set.
+      * structure_source: "grobid" or "page_fallback" (null before Day 6 / never processed).
+      * grobid_outcome: "used", or why GROBID was not used (disabled, unavailable,
+        timeout, invalid_response, error).
     """
 
     id: uuid.UUID
@@ -97,6 +113,11 @@ class PaperRead(OutputSchema):
     authors: list[AuthorRead] | None
     publication_year: int | None
     doi: str | None
+    venue: str | None
     processed_at: datetime | None
+    structure_source: Literal["grobid", "page_fallback"] | None
+    grobid_outcome: Literal["used", "disabled", "unavailable", "timeout", "invalid_response", "error"] | None
+    last_extraction_failure_code: str | None
+    last_extraction_attempt_at: datetime | None
     created_at: datetime
     updated_at: datetime
